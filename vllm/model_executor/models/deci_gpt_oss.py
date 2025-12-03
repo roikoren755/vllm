@@ -63,7 +63,7 @@ class DeciGptOssAttention(gpt_oss.OAIAttention):
             hidden_size=config.hidden_size,
             max_position_embeddings=config.max_position_embeddings,
             rope_theta=config.rope_theta,
-            rope_scaling=config.rope_scaling,
+            rope_parameters=config.rope_parameters,
             sliding_window=attention_config.window_length,
         )
         sliding_window = attention_config.window_length
