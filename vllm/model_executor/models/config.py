@@ -271,6 +271,10 @@ class GptOssForCausalLMConfig(VerifyAndUpdateConfig):
             )
 
 
+class DeciGptOssForCausalLMConfig(GptOssForCausalLMConfig):
+    pass
+
+
 class MambaModelConfig(VerifyAndUpdateConfig):
     @classmethod
     def verify_and_update_config(cls, vllm_config: "VllmConfig") -> None:
@@ -521,6 +525,7 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "JinaVLForRanking": JinaVLForSequenceClassificationConfig,
     "JambaForSequenceClassification": JambaForSequenceClassificationConfig,
     "GptOssForCausalLM": GptOssForCausalLMConfig,
+    "DeciGptOssForCausalLM": DeciGptOssForCausalLMConfig,
     "MambaForCausalLM": MambaModelConfig,
     "Mamba2ForCausalLM": MambaModelConfig,
     "FalconMambaForCausalLM": MambaModelConfig,

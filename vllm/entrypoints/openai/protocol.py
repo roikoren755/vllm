@@ -1455,6 +1455,14 @@ class ChatMessage(OpenAIBaseModel):
     reasoning_content: str | None = None
     """Deprecated: use `reasoning` instead."""
 
+    def __init__(self, **kwargs):
+        """
+        Convert None to empty string for content
+        """
+        if "content" in kwargs and kwargs["content"] is None:
+            kwargs["content"] = ""
+        super().__init__(**kwargs)
+
     @model_validator(mode="after")
     def handle_deprecated_reasoning_content(self):
         """Copy reasoning to reasoning_content for backward compatibility."""

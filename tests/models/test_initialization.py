@@ -108,7 +108,7 @@ def can_initialize(
         patch.object(V1EngineCore, "_initialize_kv_caches", _initialize_kv_caches_v1),
         monkeypatch.context() as m,
     ):
-        if model_arch == "GptOssForCausalLM":
+        if model_arch in ("GptOssForCausalLM", "DeciGptOssForCausalLM"):
             # FIXME: A hack to bypass FA3 assertion because our CI's L4 GPU
             # has cc==8.9 which hasn't supported FA3 yet. Remove this hack when
             # L4 supports FA3.
