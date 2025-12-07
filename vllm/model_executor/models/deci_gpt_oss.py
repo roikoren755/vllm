@@ -7,7 +7,8 @@ import torch
 from torch import nn
 from transformers import GptOssConfig, PretrainedConfig
 
-from vllm.attention import Attention, AttentionType
+from vllm.attention.backends.abstract import AttentionType
+from vllm.attention.layer import Attention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import (
@@ -26,7 +27,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models import gpt_oss
-from vllm.utils import cdiv
+from vllm.utils.math_utils import cdiv
 
 from .utils import (
     extract_layer_index,
@@ -110,7 +111,7 @@ class DeciGptOssAttention(gpt_oss.OAIAttention):
         self.scaling = self.head_dim**-0.5
         self.rope_theta = config.rope_theta
 
-        self.qkv = QKVParallelLinear(
+        self.qkv_proj = QKVParallelLinear(
             hidden_size=self.hidden_size,
             head_size=self.head_dim,
             total_num_heads=self.num_attention_heads,
@@ -266,9 +267,9 @@ class DeciGptOssModel(gpt_oss.GptOssModel):
         """
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
-            (".qkv", ".q_proj", "q"),
-            (".qkv", ".k_proj", "k"),
-            (".qkv", ".v_proj", "v"),
+            (".qkv_proj", ".q_proj", "q"),
+            (".qkv_proj", ".k_proj", "k"),
+            (".qkv_proj", ".v_proj", "v"),
         ]
 
         quant_method = (
