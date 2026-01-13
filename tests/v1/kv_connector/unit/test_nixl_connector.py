@@ -51,7 +51,12 @@ from vllm.v1.engine.output_processor import OutputProcessor
 from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import RequestStatus
 
-from .utils import create_request, create_scheduler, create_vllm_config, make_kv_cache_config
+from .utils import (
+    create_request,
+    create_scheduler,
+    create_vllm_config,
+    make_kv_cache_config,
+)
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -361,8 +366,10 @@ def test_kv_transfer_handshake(dist_init):
             do_remote_decode=True,
         )
         request.status = RequestStatus.FINISHED_LENGTH_CAPPED
-        delay, kv_connector_metadata = scheduler.get_kv_connector().request_finished_all_groups(
-            request, ([0, 1, 2],)
+        delay, kv_connector_metadata = (
+            scheduler.get_kv_connector().request_finished_all_groups(
+                request, ([0, 1, 2],)
+            )
         )
         assert delay
 
@@ -1610,9 +1617,15 @@ def test_shutdown_cleans_up_resources(default_vllm_config, dist_init):
     vllm_config = create_vllm_config()
 
     scheduler = NixlConnectorScheduler(
-        vllm_config, vllm_config.kv_transfer_config.engine_id, make_kv_cache_config(block_size=16)
+        vllm_config,
+        vllm_config.kv_transfer_config.engine_id,
+        make_kv_cache_config(block_size=16),
     )
-    worker = NixlConnectorWorker(vllm_config, vllm_config.kv_transfer_config.engine_id, make_kv_cache_config(block_size=16))
+    worker = NixlConnectorWorker(
+        vllm_config,
+        vllm_config.kv_transfer_config.engine_id,
+        make_kv_cache_config(block_size=16),
+    )
     nixl_wrapper = worker.nixl_wrapper
 
     with (
