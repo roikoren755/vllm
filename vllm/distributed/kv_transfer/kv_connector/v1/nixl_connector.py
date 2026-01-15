@@ -1023,6 +1023,10 @@ class NixlConnectorWorker:
         # Track physical base addresses for tensor registration
         self.seen_base_addresses: list[int] = []
 
+        # DEBUG: Store reference to KV caches for debugging
+        self._debug_kv_caches: dict[str, torch.Tensor] | None = None
+        self._debug_saved_cache = False  # Only save once
+
         # nixl_prepped_dlist_handle.
         self.src_xfer_handles_by_block_size: dict[int, int] = {}
         # Populated dynamically during handshake based on remote configuration.
@@ -1103,6 +1107,9 @@ class NixlConnectorWorker:
             attn_backend=backend,
         )
         self._physical_blocks_per_logical_kv_block = 1
+        # Per-group block size ratios for hybrid models (Mamba + Attention)
+        # Each group may have a different logical-to-kernel block ratio
+        self._physical_blocks_per_logical_per_group: list[int] = []
 
     def _nixl_handshake(
         self,
@@ -1371,6 +1378,9 @@ class NixlConnectorWorker:
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register the KV Cache data in nixl."""
 
+        # DEBUG: Store reference to KV caches for debugging
+        self._debug_kv_caches = kv_caches
+
         if self.use_host_buffer:
             self.initialize_host_xfer_buffer(kv_caches=kv_caches)
             assert len(self.host_xfer_buffers) == len(kv_caches), (
@@ -1446,8 +1456,11 @@ class NixlConnectorWorker:
         if is_hybrid_model and self.kv_cache_config is not None:
             # Build group-to-type mapping based on kv_cache_spec type
             spec_type_to_groups: dict[type, list[int]] = {}
+            # Store logical block size per group for later ratio calculation
+            logical_block_size_per_group: list[int] = []
             for group_idx, group in enumerate(self.kv_cache_config.kv_cache_groups):
                 is_mamba_group = isinstance(group.kv_cache_spec, MambaSpec)
+                logical_block_size_per_group.append(group.kv_cache_spec.block_size)
                 for layer_name in group.layer_names:
                     layer_to_group[layer_name] = group_idx
                     layer_is_mamba[layer_name] = is_mamba_group
@@ -1466,6 +1479,14 @@ class NixlConnectorWorker:
             # Initialize regions_per_group with empty lists for each group
             num_groups = len(self.kv_cache_config.kv_cache_groups)
             self.regions_per_group = [[] for _ in range(num_groups)]
+            # Initialize per-group block ratios (will be updated during tensor processing)
+            # Default to 1, will be calculated for attention groups when we see their tensors
+            self._physical_blocks_per_logical_per_group = [1] * num_groups
+            self._logical_block_size_per_group = logical_block_size_per_group
+            logger.info(
+                "Hybrid model logical block sizes per group: %s",
+                logical_block_size_per_group,
+            )
 
         # Enable different block lengths for different layers when MLA is used.
         self.block_len_per_layer = list[int]()
@@ -1517,6 +1538,26 @@ class NixlConnectorWorker:
                         self.block_size = kernel_block_size
                         self._block_size[self.engine_id] = kernel_block_size
 
+                    # For hybrid models: calculate per-group ratio
+                    if is_hybrid_model and layer_name in layer_to_group:
+                        group_idx = layer_to_group[layer_name]
+                        logical_bs = self._logical_block_size_per_group[group_idx]
+                        ratio = logical_bs // kernel_block_size
+                        if (
+                            self._physical_blocks_per_logical_per_group[group_idx] == 1
+                            and ratio > 1
+                        ):
+                            self._physical_blocks_per_logical_per_group[group_idx] = (
+                                ratio
+                            )
+                            logger.info(
+                                "Group %d: logical_block_size=%d, kernel_block_size=%d, ratio=%d",
+                                group_idx,
+                                logical_bs,
+                                kernel_block_size,
+                                ratio,
+                            )
+
                 # Track region index before appending
                 region_idx = len(seen_base_addresses)
 
@@ -1533,7 +1574,7 @@ class NixlConnectorWorker:
                     # Non-block-first Attention: shape is [2, total_tokens, num_heads, head_dim]
                     # Calculate num_blocks = total_tokens / block_size
                     # Note: self.block_size may have been updated to kernel_block_size above
-                    total_tokens = cache.shape[1]
+                    total_tokens = cache.shape[1] * cache.shape[2]
                     curr_num_blocks = total_tokens // self.block_size
                     logger.debug(
                         "Non-block-first attention: total_tokens=%d, block_size=%d, "
@@ -2296,6 +2337,45 @@ class NixlConnectorWorker:
                 len(done_recving),
             )
 
+        # # DEBUG: Save KV cache to disk after first transfer (once only)
+        # if not self._debug_saved_cache and self._debug_kv_caches is not None:
+        #     def _clone_kv_cache(v):
+        #         # Handle both tensor and list of tensors
+        #         if isinstance(v, torch.Tensor):
+        #             return v.cpu().clone()
+        #         elif isinstance(v, list):
+        #             return [t.cpu().clone() if isinstance(t, torch.Tensor) else t for t in v]
+        #         return v
+
+        #     if len(done_sending) > 0:
+        #         # This is P (prefill) - save after first send completes
+        #         save_path = f"kv_cache_P_rank{self.tp_rank}.pt"
+        #         print(f"DEBUG: Saving P KV cache to {save_path}", flush=True)
+        #         debug_data = {
+        #             "kv_caches": {k: _clone_kv_cache(v) for k, v in self._debug_kv_caches.items()},
+        #             "engine_id": self.engine_id,
+        #             "role": "prefill",
+        #             "regions_per_group": self.regions_per_group,
+        #             "num_blocks_per_region": self.num_blocks_per_region,
+        #             "region_block_offsets": self.region_block_offsets,
+        #         }
+        #         torch.save(debug_data, save_path)
+        #         self._debug_saved_cache = True
+        #     elif len(done_recving) > 0:
+        #         # This is D (decode) - save after first receive completes
+        #         save_path = f"kv_cache_D_rank{self.tp_rank}.pt"
+        #         print(f"DEBUG: Saving D KV cache to {save_path}", flush=True)
+        #         debug_data = {
+        #             "kv_caches": {k: _clone_kv_cache(v) for k, v in self._debug_kv_caches.items()},
+        #             "engine_id": self.engine_id,
+        #             "role": "decode",
+        #             "regions_per_group": self.regions_per_group,
+        #             "num_blocks_per_region": self.num_blocks_per_region,
+        #             "region_block_offsets": self.region_block_offsets,
+        #         }
+        #         torch.save(debug_data, save_path)
+        #         self._debug_saved_cache = True
+
         block_ids_for_blocksize_post_process = defaultdict(list)
         for req_id in done_recving:
             # clean up metadata for completed requests
@@ -2753,51 +2833,52 @@ class NixlConnectorWorker:
             and isinstance(block_ids[0], (list, tuple))
         )
 
-        # For hybrid models with grouped block_ids, map each group's blocks
-        # to only that group's regions (not all regions).
-        if self.is_hybrid_model and is_grouped and len(self.regions_per_group) > 0:
-            all_descs: list[np.ndarray] = []
-            for group_idx, group_block_ids in enumerate(block_ids):
-                if len(group_block_ids) == 0:
+        # For hybrid models with grouped block_ids, we must generate descriptors
+        # PER-GROUP to avoid cross-pool contamination. Each group's blocks should
+        # only map to that group's regions (or its sibling's regions if empty due to HMA).
+        #
+        # Example with Mamba (groups 0-3, regions 0-11) and Attention (group 4, regions 12-17):
+        # - Mamba blocks [1,2,3,4] -> only regions 0-11 (not 12-17!)
+        # - Attention blocks [1305-1309] -> only regions 12-17 (not 0-11!)
+        #
+        # The flat "all regions × all blocks" approach causes cross-contamination where
+        # (Mamba region, Attention block) points to a random Mamba block from another request.
+        if is_grouped and self.is_hybrid_model and self.regions_per_group:
+            # Per-group descriptor generation for hybrid models
+            all_descs = []
+
+            for group_idx, group_blocks in enumerate(block_ids):
+                if not group_blocks:
                     continue
-                if group_idx >= len(self.regions_per_group):
-                    logger.warning(
-                        "Group index %d exceeds regions_per_group length %d",
-                        group_idx,
-                        len(self.regions_per_group),
-                    )
+
+                # Get regions for this group (regions_per_group is a list)
+                regions = (
+                    self.regions_per_group[group_idx]
+                    if group_idx < len(self.regions_per_group)
+                    else []
+                )
+
+                # If empty (due to HMA pooling), use the primary sibling's regions
+                if not regions and group_idx in self.group_siblings:
+                    for sibling_idx in self.group_siblings[group_idx]:
+                        sibling_regions = (
+                            self.regions_per_group[sibling_idx]
+                            if sibling_idx < len(self.regions_per_group)
+                            else []
+                        )
+                        if sibling_regions:
+                            regions = sibling_regions
+                            break
+
+                if not regions:
                     continue
 
-                group_regions = self.regions_per_group[group_idx]
-
-                if len(group_regions) == 0:
-                    # Group has no regions - shared via HMA with a sibling group.
-                    # Use the PRIMARY sibling's regions but with THIS group's block IDs.
-                    if group_idx in self.group_siblings:
-                        for sibling_idx in self.group_siblings[group_idx]:
-                            if sibling_idx < len(self.regions_per_group):
-                                sibling_regs = self.regions_per_group[sibling_idx]
-                                if len(sibling_regs) > 0:
-                                    group_regions = sibling_regs
-                                    break
-                    if len(group_regions) == 0:
-                        continue
-
-                # Compute desc_ids for this group: group_regions × group_blocks
-                group_block_ids_arr = np.array(group_block_ids)[None, :]
-
-                if self.region_block_offsets:
-                    region_offsets = np.array(
-                        [self.region_block_offsets[r] for r in group_regions]
-                    )[:, None]
-                    group_descs = region_offsets + group_block_ids_arr
-                else:
-                    # Fallback to original formula
-                    group_region_ids = np.array(group_regions)[:, None]
-                    group_descs = group_region_ids * num_blocks + group_block_ids_arr
-
-                flat_descs = group_descs.flatten()
-                all_descs.append(flat_descs)
+                # Generate descriptors for this group's regions × this group's blocks
+                group_blocks_arr = np.array(group_blocks)
+                for region_idx in regions:
+                    offset = self.region_block_offsets[region_idx]
+                    descs = offset + group_blocks_arr
+                    all_descs.append(descs)
 
             if all_descs:
                 result = np.concatenate(all_descs)
@@ -2805,28 +2886,20 @@ class NixlConnectorWorker:
                 result = np.array([], dtype=np.int64)
             return result
 
-        # Non-hybrid model or flat block_ids: original behavior
-        # All regions × all blocks
+        # Non-hybrid model or flat block_ids: all regions × all blocks
         region_ids = np.arange(self.num_regions)
 
         # Handle both flat list and tuple of lists.
-        # _logical_to_kernel_block_ids returns flat list when physical_blocks_per_logical != 1
         if is_grouped:
-            # tuple[list[int], ...] or list[list[int]] - need to concatenate
             block_ids_flat = np.concatenate(block_ids)
         else:
-            # Already a flat list/array
             block_ids_flat = np.asarray(block_ids)
 
         # Compute the desc ids for each block.
         region_ids = region_ids[:, None]
         block_ids_2d = block_ids_flat[None, :]
 
-        # For hybrid models with variable block counts, use offset-based formula.
-        # For non-hybrid models, the original formula works since all regions
-        # have the same block count.
         if self.region_block_offsets and len(set(self.num_blocks_per_region)) > 1:
-            # Variable block counts - use cumulative offsets
             region_offsets = np.array(self.region_block_offsets)[:, None]
             descs_ids = region_offsets + block_ids_2d
         else:
@@ -2838,7 +2911,35 @@ class NixlConnectorWorker:
         Convert logical block ids to kernel physical block ids.
         This is required when the logical block size (the one set by the user)
         does not match the one required by the attn backend.
+
+        For hybrid models (Mamba + Attention), different groups have different
+        logical-to-kernel block ratios:
+        - Mamba groups: ratio = 1 (no conversion needed)
+        - Attention groups: ratio = logical_block_size / kernel_block_size
         """
+        # For hybrid models with per-group ratios
+        if self._physical_blocks_per_logical_per_group:
+            result = []
+            for group_idx, group_block_ids in enumerate(block_ids):
+                ratio = (
+                    self._physical_blocks_per_logical_per_group[group_idx]
+                    if group_idx < len(self._physical_blocks_per_logical_per_group)
+                    else 1
+                )
+                if ratio == 1 or not group_block_ids:
+                    # No conversion needed for Mamba or empty groups
+                    result.append(group_block_ids)
+                else:
+                    # Convert logical → kernel for this group
+                    block_ids_np = np.array(group_block_ids)
+                    block_arange = np.arange(0, ratio).reshape(1, -1)
+                    kernel_ids = BlockTable.map_to_kernel_blocks(
+                        block_ids_np, ratio, block_arange
+                    )
+                    result.append(kernel_ids.tolist())
+            return tuple(result)
+
+        # Non-hybrid model: use global ratio
         if self._physical_blocks_per_logical_kv_block == 1:
             # Noop when physical and logical block sizes are the same
             return block_ids
