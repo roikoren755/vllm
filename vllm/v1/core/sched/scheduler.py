@@ -47,7 +47,7 @@ from vllm.v1.core.sched.output import (
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import (
     PrefixCacheStats,
@@ -129,6 +129,16 @@ class Scheduler(SchedulerInterface):
                 self.vllm_config.kv_transfer_config.kv_load_failure_policy
             )
             self.recompute_kv_load_failures = kv_load_failure_policy == "recompute"
+            fa_group_idx = next(
+                (
+                    i
+                    for i, group in enumerate(kv_cache_config.kv_cache_groups)
+                    if isinstance(group.kv_cache_spec, FullAttentionSpec)
+                ),
+                None,
+            )
+            assert fa_group_idx is not None
+            self._full_attention_group_idx: int = fa_group_idx
 
         self.kv_event_publisher = EventPublisherFactory.create(
             self.kv_events_config,
@@ -1740,7 +1750,7 @@ class Scheduler(SchedulerInterface):
             block_ids = self.kv_cache_manager.get_block_ids(request.request_id)
             # When connector does not support HMA, a single group is present here
             num_computed_tokens = (
-                max(len(group) for group in block_ids) * self.block_size
+                len(block_ids[self._full_attention_group_idx]) * self.block_size
             )
             # Get number of blocks on full attention layer, we can retrieve at most
             # this many tokens
@@ -1823,10 +1833,8 @@ class Scheduler(SchedulerInterface):
             req_block_ids = self.kv_cache_manager.get_block_ids(req_id)
             # Assume FA group is present to infer number of computed tokens
             # TODO this is not padded for SW right?
-            fa_blocks_idx = max(
-                range(len(req_block_ids)), key=lambda x: len(req_block_ids[x])
-            )
-            max_num_blocks = len(req_block_ids[fa_blocks_idx])
+            fa_blocks = req_block_ids[self._full_attention_group_idx]
+            max_num_blocks = len(fa_blocks)
             # We iterate only over blocks that may contain externally computed
             # tokens
             if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
@@ -1846,10 +1854,7 @@ class Scheduler(SchedulerInterface):
             ) // self.block_size
             # For the purpose of marking blocks as invalid, only report FA ones to
             # handle blocks<>tokens mapping consistently.
-            # for idx, block_id in zip(range(req_num_computed_blocks), req_block_ids):
-            for idx, block_id in zip(
-                range(req_num_computed_blocks), req_block_ids[fa_blocks_idx]
-            ):
+            for idx, block_id in zip(range(req_num_computed_blocks), fa_blocks):
                 if block_id not in invalid_block_ids:
                     continue
 

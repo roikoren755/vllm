@@ -3,7 +3,6 @@
 import contextlib
 import copy
 import logging
-import math
 import os
 import queue
 import sys
@@ -56,6 +55,7 @@ from vllm.distributed.parallel_state import (
 from vllm.forward_context import ForwardContext
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm.utils.math_utils import cdiv
 from vllm.utils.network_utils import make_zmq_path, make_zmq_socket
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
 from vllm.v1.attention.backends.utils import get_kv_cache_layout
@@ -569,7 +569,9 @@ class NixlConnectorScheduler:
             else 0
             for group in kv_cache_config.kv_cache_groups
         ]
-        self.sw_sizes = [n_tokens // self.block_size for n_tokens in sw_sizes_tokens]
+        self.sw_sizes = [
+            cdiv(n_tokens, self.block_size) for n_tokens in sw_sizes_tokens
+        ]
 
     def shutdown(self):
         self._stop_event.set()
