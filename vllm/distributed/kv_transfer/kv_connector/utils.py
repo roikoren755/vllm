@@ -456,7 +456,14 @@ def get_current_attn_backend(vllm_config: VllmConfig):
     layer_type = cast(type[Any], AttentionLayerBase)
     layers = get_layers_from_vllm_config(vllm_config, layer_type, None)
     if layers:
-        backend = next(iter(layers.values())).get_attn_backend()
+        backend = None
+        layers_iterator = iter(layers.values())
+        while backend is None:
+            backend = next(layers_iterator).get_attn_backend()
+            try:
+                backend.get_name()
+            except NotImplementedError:
+                backend = None
     else:
         # Fallback for tests, when static_forward_context is empty.
         logger.debug(
