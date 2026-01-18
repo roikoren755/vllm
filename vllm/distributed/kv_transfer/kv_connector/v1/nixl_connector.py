@@ -1509,7 +1509,7 @@ class NixlConnectorWorker:
             if is_mamba and len(cache_list) > 0:
                 # Get storage info from the first tensor (all share same storage)
                 first_cache = cache_list[0]
-                storage = first_cache.storage()
+                storage = first_cache.untyped_storage()
                 storage_base_addr = storage.data_ptr()
                 storage_size = storage.nbytes()
 
