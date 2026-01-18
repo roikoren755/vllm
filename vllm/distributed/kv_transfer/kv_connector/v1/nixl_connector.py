@@ -1023,10 +1023,6 @@ class NixlConnectorWorker:
         # Track physical base addresses for tensor registration
         self.seen_base_addresses: list[int] = []
 
-        # DEBUG: Store reference to KV caches for debugging
-        self._debug_kv_caches: dict[str, torch.Tensor] | None = None
-        self._debug_saved_cache = False  # Only save once
-
         # nixl_prepped_dlist_handle.
         self.src_xfer_handles_by_block_size: dict[int, int] = {}
         # Populated dynamically during handshake based on remote configuration.
@@ -1073,7 +1069,7 @@ class NixlConnectorWorker:
 
         self.use_mla = self.model_config.use_mla
 
-        # Get the attention backend from the first layer
+        # Get the attention backend from the first "real attention" layer
         # NOTE (NickLucche) models with multiple backends are not supported yet
         backend = get_current_attn_backend(vllm_config)
 
@@ -1378,9 +1374,6 @@ class NixlConnectorWorker:
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register the KV Cache data in nixl."""
 
-        # DEBUG: Store reference to KV caches for debugging
-        self._debug_kv_caches = kv_caches
-
         if self.use_host_buffer:
             self.initialize_host_xfer_buffer(kv_caches=kv_caches)
             assert len(self.host_xfer_buffers) == len(kv_caches), (
@@ -1412,6 +1405,7 @@ class NixlConnectorWorker:
         # may share the same memory pool but have different tensor sizes.
         seen_base_addresses = []
         seen_addr_size_pairs: set[tuple[int, int]] = set()
+        addr_size_to_region_idx: dict[tuple[int, int], int] = {}
 
         # Note(tms): I modified this from the original region setup code.
         # K and V are now in different regions. Advantage is that we can
@@ -1453,6 +1447,9 @@ class NixlConnectorWorker:
         layer_to_group: dict[str, int] = {}
         # Track layer_name -> is_mamba for slot_size calculation
         layer_is_mamba: dict[str, bool] = {}
+        # Track layer_name -> page_size_bytes for Mamba layers
+        # This is needed to register Mamba as single contiguous regions
+        layer_mamba_page_size: dict[str, int] = {}
         if is_hybrid_model and self.kv_cache_config is not None:
             # Build group-to-type mapping based on kv_cache_spec type
             spec_type_to_groups: dict[type, list[int]] = {}
@@ -1464,6 +1461,11 @@ class NixlConnectorWorker:
                 for layer_name in group.layer_names:
                     layer_to_group[layer_name] = group_idx
                     layer_is_mamba[layer_name] = is_mamba_group
+                    # Store page_size_bytes for Mamba layers
+                    if is_mamba_group:
+                        layer_mamba_page_size[layer_name] = (
+                            group.kv_cache_spec.page_size_bytes
+                        )
 
                 # Track groups by spec type
                 spec_type = type(group.kv_cache_spec)
@@ -1497,12 +1499,105 @@ class NixlConnectorWorker:
             else:
                 cache_list = [cache_or_caches]
 
+            # Check if this is a Mamba layer FIRST (before per-tensor iteration)
+            is_mamba = layer_is_mamba.get(layer_name, False)
+
+            # For Mamba layers: conv_state and ssm_state are strided views into
+            # a single contiguous storage. We register the storage as ONE region
+            # with page_size_bytes as the block length. This ensures NIXL
+            # transfers the full block data including both conv and ssm states.
+            if is_mamba and len(cache_list) > 0:
+                # Get storage info from the first tensor (all share same storage)
+                first_cache = cache_list[0]
+                storage = first_cache.storage()
+                storage_base_addr = storage.data_ptr()
+                storage_size = storage.nbytes()
+
+                # Use storage address/size as key (not tensor address/size)
+                addr_size_key = (storage_base_addr, storage_size)
+                if addr_size_key in seen_addr_size_pairs:
+                    if is_hybrid_model and layer_name in layer_to_group:
+                        group_idx = layer_to_group[layer_name]
+                        region_idx = addr_size_to_region_idx.get(addr_size_key)
+                        if (
+                            region_idx is not None
+                            and region_idx not in self.regions_per_group[group_idx]
+                        ):
+                            self.regions_per_group[group_idx].append(region_idx)
+                    continue
+                seen_addr_size_pairs.add(addr_size_key)
+
+                # Get page_size_bytes from MambaSpec
+                page_size_bytes = layer_mamba_page_size.get(layer_name, 0)
+                if page_size_bytes == 0:
+                    # Fallback: compute from stride of first tensor
+                    page_size_bytes = (
+                        first_cache.stride()[0] * first_cache.element_size()
+                    )
+
+                # num_blocks is shape[0] of any tensor in the list
+                curr_num_blocks = first_cache.shape[0]
+
+                # Track region index before appending
+                region_idx = len(seen_base_addresses)
+                seen_base_addresses.append(storage_base_addr)
+                addr_size_to_region_idx[addr_size_key] = region_idx
+
+                # Track per-region block count
+                self.num_blocks_per_region.append(curr_num_blocks)
+                if (
+                    not self.num_blocks_per_region
+                    or len(self.num_blocks_per_region) == 1
+                ):
+                    self.num_blocks = curr_num_blocks
+
+                # Block length = page_size_bytes (covers both conv and ssm states)
+                self.block_len_per_layer.append(page_size_bytes)
+                self.is_mamba_region.append(True)
+                # Mamba: no "tokens per block" concept
+                self.slot_size_per_layer.append(0)
+
+                # Device ID
+                self.device_id = max(first_cache.get_device(), 0)
+
+                # Register with NIXL - use storage base addr and size
+                caches_data.append(
+                    (storage_base_addr, storage_size, self.device_id, "")
+                )
+
+                # Track which group this region belongs to (for hybrid models)
+                if is_hybrid_model and layer_name in layer_to_group:
+                    group_idx = layer_to_group[layer_name]
+                    self.regions_per_group[group_idx].append(region_idx)
+
+                logger.debug(
+                    "Registered Mamba layer %s: storage_addr=%x, storage_size=%d, "
+                    "page_size_bytes=%d, num_blocks=%d",
+                    layer_name,
+                    storage_base_addr,
+                    storage_size,
+                    page_size_bytes,
+                    curr_num_blocks,
+                )
+
+                # Skip the per-tensor loop for Mamba
+                continue
+
+            # Non-Mamba: process each tensor in the list
             for cache in cache_list:
                 base_addr = cache.data_ptr()
                 tensor_size = cache.numel() * cache.element_size()
                 addr_size_key = (base_addr, tensor_size)
 
                 if addr_size_key in seen_addr_size_pairs:
+                    if is_hybrid_model and layer_name in layer_to_group:
+                        group_idx = layer_to_group[layer_name]
+                        region_idx = addr_size_to_region_idx.get(addr_size_key)
+                        if (
+                            region_idx is not None
+                            and region_idx not in self.regions_per_group[group_idx]
+                        ):
+                            self.regions_per_group[group_idx].append(region_idx)
                     # NOTE (NickLucche) HMA employs memory pooling to share tensors
                     # across groups. This results in skipping all tensors but the ones
                     # pointed to by group0. Also, generally we will have more blocks
@@ -1514,61 +1609,57 @@ class NixlConnectorWorker:
 
                 seen_addr_size_pairs.add(addr_size_key)
 
-                # Check if this is a Mamba layer FIRST (before block_size logic)
-                is_mamba = layer_is_mamba.get(layer_name, False)
-
                 # For ATTENTION: Extract kernel_block_size from tensor shape
-                # For MAMBA: Skip - no "tokens per block" concept
-                if not is_mamba:
-                    kernel_block_size = cache.shape[block_size_position]
+                # (Mamba is handled in the outer loop above)
+                kernel_block_size = cache.shape[block_size_position]
 
-                    if self.block_size != kernel_block_size:
-                        logger.info_once(
-                            "User-specified logical block size (%s) does not match"
-                            " physical kernel block size (%s). Using the latter.",
-                            self.block_size,
-                            kernel_block_size,
+                if self.block_size != kernel_block_size:
+                    logger.info_once(
+                        "User-specified logical block size (%s) does not match"
+                        " physical kernel block size (%s). Using the latter.",
+                        self.block_size,
+                        kernel_block_size,
+                    )
+                    # Only compute the block size ratio for non-hybrid models.
+                    if not is_hybrid_model:
+                        self._physical_blocks_per_logical_kv_block = (
+                            self.block_size // kernel_block_size
                         )
-                        # Only compute the block size ratio for non-hybrid models.
-                        if not is_hybrid_model:
-                            self._physical_blocks_per_logical_kv_block = (
-                                self.block_size // kernel_block_size
-                            )
-                        # Update block_size from Attention tensors only
-                        self.block_size = kernel_block_size
-                        self._block_size[self.engine_id] = kernel_block_size
+                    # Update block_size from Attention tensors only
+                    self.block_size = kernel_block_size
+                    self._block_size[self.engine_id] = kernel_block_size
 
-                    # For hybrid models: calculate per-group ratio
-                    if is_hybrid_model and layer_name in layer_to_group:
-                        group_idx = layer_to_group[layer_name]
-                        logical_bs = self._logical_block_size_per_group[group_idx]
-                        ratio = logical_bs // kernel_block_size
-                        if (
-                            self._physical_blocks_per_logical_per_group[group_idx] == 1
-                            and ratio > 1
-                        ):
-                            self._physical_blocks_per_logical_per_group[group_idx] = (
-                                ratio
-                            )
-                            logger.info(
-                                "Group %d: logical_block_size=%d, kernel_block_size=%d, ratio=%d",
-                                group_idx,
-                                logical_bs,
-                                kernel_block_size,
-                                ratio,
-                            )
+                # For hybrid models: calculate per-group ratio
+                if is_hybrid_model and layer_name in layer_to_group:
+                    group_idx = layer_to_group[layer_name]
+                    logical_bs = self._logical_block_size_per_group[group_idx]
+                    ratio = logical_bs // kernel_block_size
+                    if (
+                        self._physical_blocks_per_logical_per_group[group_idx] == 1
+                        and ratio > 1
+                    ):
+                        self._physical_blocks_per_logical_per_group[group_idx] = ratio
+                        logger.info(
+                            "Group %d: logical_block_size=%d, kernel_block_size=%d, ratio=%d",
+                            group_idx,
+                            logical_bs,
+                            kernel_block_size,
+                            ratio,
+                        )
 
                 # Track region index before appending
                 region_idx = len(seen_base_addresses)
 
                 seen_base_addresses.append(base_addr)
+                addr_size_to_region_idx[addr_size_key] = region_idx
 
                 # Calculate num_blocks based on memory layout
                 # For block-first layouts (FlashInfer): shape is [num_blocks, ...]
                 # For non-block-first layouts (FLASH_ATTN): shape is [2, num_tokens, ...]
                 #   where shape[0] = 2 (K and V), NOT num_blocks!
-                if self.kv_topo.is_kv_layout_blocks_first or is_mamba:
-                    # Block-first or Mamba: shape[0] is num_blocks
+                # (Mamba is handled in the outer loop above)
+                if self.kv_topo.is_kv_layout_blocks_first:
+                    # Block-first: shape[0] is num_blocks
                     curr_num_blocks = cache.shape[0]
                 else:
                     # Non-block-first Attention: shape is [2, total_tokens, num_heads, head_dim]
@@ -1605,17 +1696,14 @@ class NixlConnectorWorker:
                 self.block_len_per_layer.append(tensor_size // curr_num_blocks)
 
                 # Track if this region is Mamba (state) vs Attention (KV)
-                self.is_mamba_region.append(is_mamba)
+                # (This loop only handles non-Mamba layers; Mamba handled above)
+                self.is_mamba_region.append(False)
 
                 # slot_size = bytes per token slot (block_len / tokens_per_block)
-                # For Mamba: set to 0 since there's no "tokens per block" concept
                 # For Attention: block_len / block_size gives HD bytes per token
-                if is_mamba:
-                    self.slot_size_per_layer.append(0)
-                else:
-                    self.slot_size_per_layer.append(
-                        self.block_len_per_layer[-1] // self.block_size
-                    )
+                self.slot_size_per_layer.append(
+                    self.block_len_per_layer[-1] // self.block_size
+                )
 
                 # Need to make sure the device ID is non-negative for NIXL,
                 # Torch uses -1 to indicate CPU tensors.
@@ -2336,45 +2424,6 @@ class NixlConnectorWorker:
                 len(done_sending),
                 len(done_recving),
             )
-
-        # # DEBUG: Save KV cache to disk after first transfer (once only)
-        # if not self._debug_saved_cache and self._debug_kv_caches is not None:
-        #     def _clone_kv_cache(v):
-        #         # Handle both tensor and list of tensors
-        #         if isinstance(v, torch.Tensor):
-        #             return v.cpu().clone()
-        #         elif isinstance(v, list):
-        #             return [t.cpu().clone() if isinstance(t, torch.Tensor) else t for t in v]
-        #         return v
-
-        #     if len(done_sending) > 0:
-        #         # This is P (prefill) - save after first send completes
-        #         save_path = f"kv_cache_P_rank{self.tp_rank}.pt"
-        #         print(f"DEBUG: Saving P KV cache to {save_path}", flush=True)
-        #         debug_data = {
-        #             "kv_caches": {k: _clone_kv_cache(v) for k, v in self._debug_kv_caches.items()},
-        #             "engine_id": self.engine_id,
-        #             "role": "prefill",
-        #             "regions_per_group": self.regions_per_group,
-        #             "num_blocks_per_region": self.num_blocks_per_region,
-        #             "region_block_offsets": self.region_block_offsets,
-        #         }
-        #         torch.save(debug_data, save_path)
-        #         self._debug_saved_cache = True
-        #     elif len(done_recving) > 0:
-        #         # This is D (decode) - save after first receive completes
-        #         save_path = f"kv_cache_D_rank{self.tp_rank}.pt"
-        #         print(f"DEBUG: Saving D KV cache to {save_path}", flush=True)
-        #         debug_data = {
-        #             "kv_caches": {k: _clone_kv_cache(v) for k, v in self._debug_kv_caches.items()},
-        #             "engine_id": self.engine_id,
-        #             "role": "decode",
-        #             "regions_per_group": self.regions_per_group,
-        #             "num_blocks_per_region": self.num_blocks_per_region,
-        #             "region_block_offsets": self.region_block_offsets,
-        #         }
-        #         torch.save(debug_data, save_path)
-        #         self._debug_saved_cache = True
 
         block_ids_for_blocksize_post_process = defaultdict(list)
         for req_id in done_recving:
