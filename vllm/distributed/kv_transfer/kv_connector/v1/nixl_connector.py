@@ -241,7 +241,6 @@ def compute_nixl_compatibility_hash(
 
 @dataclass
 class RemoteMeta:
-    # Non-HMA | HMA blocks
     block_ids: BlockIds
     host: str
     port: int
@@ -306,7 +305,6 @@ class NixlConnectorMetadata(KVConnectorMetadata):
 
 
 class NixlConnector(KVConnectorBase_V1, SupportsHMA):
-
     @property
     def prefer_cross_layer_blocks(self) -> bool:
         backend = get_current_attn_backend(self._vllm_config)
@@ -402,7 +400,6 @@ class NixlConnector(KVConnectorBase_V1, SupportsHMA):
         request: "Request",
         block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
-        # Hybrid memory allocator (HMA) enabled
         assert self.connector_scheduler is not None
         return self.connector_scheduler.request_finished(request, block_ids)
 
