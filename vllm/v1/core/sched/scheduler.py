@@ -1745,10 +1745,20 @@ class Scheduler(SchedulerInterface):
         else:
             # Now that the blocks are ready, actually cache them.
             block_ids = self.kv_cache_manager.get_block_ids(request.request_id)
-            # When connector does not support HMA, a single group is present here
-            num_computed_tokens = (
-                len(block_ids[self._full_attention_group_idx]) * self.block_size
-            )
+
+            # For hybrid models with different block sizes per KV cache group,
+            # we use num_prefilled_tokens from kv_transfer_params if available.
+            # This is more accurate than calculating from block counts.
+            kv_params = request.kv_transfer_params
+            if kv_params and "num_prefilled_tokens" in kv_params:
+                # Use the exact token count from prefill side
+                num_computed_tokens = kv_params["num_prefilled_tokens"]
+            else:
+                # When connector does not support HMA, a single group is present here
+                num_computed_tokens = (
+                    len(block_ids[self._full_attention_group_idx]) * self.block_size
+                )
+
             # Get number of blocks on full attention layer, we can retrieve at most
             # this many tokens
             num_computed_tokens = min(num_computed_tokens, request.num_tokens)

@@ -152,10 +152,17 @@ class NixlAgentMetadata:
     agent_metadata: bytes
     kv_caches_base_addr: list[int]
     device_id: int
-    num_blocks: int
+    num_blocks: int  # For non-hybrid models (single value for all regions)
     block_lens: list[int]
     kv_cache_layout: str
     block_size: int
+    # For hybrid models: block counts per physical region.
+    # If None, use num_blocks for all regions (backward compatible).
+    num_blocks_per_region: list[int] | None = None
+    # For hybrid models: which regions are Mamba (state) vs Attention (KV).
+    # Mamba regions don't have K/V split - critical for descriptor creation.
+    # If None, assume all regions are Attention (backward compatible).
+    is_mamba_region: list[bool] | None = None
 
 
 @dataclass
@@ -906,6 +913,9 @@ class NixlConnectorScheduler:
             remote_host=self.side_channel_host,
             remote_port=self.side_channel_port,
             tp_size=self.vllm_config.parallel_config.tensor_parallel_size,
+            # Number of tokens that were prefilled (needed for hybrid models where
+            # different KV cache groups have different block sizes)
+            num_prefilled_tokens=request.num_tokens,
         )
 
 
@@ -1019,6 +1029,32 @@ class NixlConnectorWorker:
         self.num_regions = 0
         self.num_layers = 0
 
+        # For hybrid models: track which regions belong to which KV cache group.
+        # This is needed to correctly map block IDs to their group's regions.
+        # regions_per_group[group_idx] = [region_idx1, region_idx2, ...]
+        self.regions_per_group: list[list[int]] = []
+        # Whether this is a hybrid model (multiple KV cache groups with different types)
+        self.is_hybrid_model: bool = False
+        # For HMA: track sibling groups (same cache type) for fallback region lookup
+        # group_siblings[group_idx] = [sibling_group_idx1, sibling_group_idx2, ...]
+        self.group_siblings: dict[int, list[int]] = {}
+        # For hybrid models: track block counts per region (different cache types
+        # have different block counts - e.g., Mamba 8059 blocks vs Attention 16)
+        # num_blocks_per_region[region_idx] = num_blocks for that region
+        self.num_blocks_per_region: list[int] = []
+        # Cumulative sum of block counts for computing descriptor IDs
+        # region_block_offsets[i] = sum(num_blocks_per_region[0:i])
+        self.region_block_offsets: list[int] = []
+        # Track which regions are Mamba (state) vs Attention (KV cache).
+        # Mamba regions don't have a "tokens per block" concept (slot_size=0).
+        self.is_mamba_region: list[bool] = []
+        # Pre-FlashInfer-doubling copies for physical descriptor registration
+        # (FlashInfer creates virtual K/V regions, but NIXL needs physical counts)
+        self._physical_num_blocks_per_region: list[int] = []
+        self._physical_region_block_offsets: list[int] = []
+        # Track physical base addresses for tensor registration
+        self.seen_base_addresses: list[int] = []
+
         # nixl_prepped_dlist_handle.
         self.src_xfer_handles_by_block_size: dict[int, int] = {}
         # Populated dynamically during handshake based on remote configuration.
@@ -1065,7 +1101,7 @@ class NixlConnectorWorker:
 
         self.use_mla = self.model_config.use_mla
 
-        # Get the attention backend from the first layer
+        # Get the attention backend from the first "real attention" layer
         # NOTE (NickLucche) models with multiple backends are not supported yet
         self.attn_backend = get_current_attn_backend(vllm_config)
 
@@ -1087,6 +1123,9 @@ class NixlConnectorWorker:
         self.xfer_stats = NixlKVConnectorStats()
 
         self._physical_blocks_per_logical_kv_block = 1
+        # Per-group block size ratios for hybrid models (Mamba + Attention)
+        # Each group may have a different logical-to-kernel block ratio
+        self._physical_blocks_per_logical_per_group: list[int] = []
 
         self.enforce_compat_hash = self.kv_transfer_config.get_from_extra_config(
             "enforce_handshake_compat", True
@@ -1398,8 +1437,15 @@ class NixlConnectorWorker:
         )
 
         caches_data = []
-        # With hybrid allocator, layers can share a kv cache tensor
+        # With hybrid allocator, layers can share a kv cache tensor.
+        # We use (base_addr, tensor_size) as the key to handle HMA correctly:
+        # - Same base_addr + same size = truly shared tensor (skip)
+        # - Same base_addr + different size = different cache type (register)
+        # This is important for hybrid models where Mamba and Attention
+        # may share the same memory pool but have different tensor sizes.
         seen_base_addresses = []
+        seen_addr_size_pairs: set[tuple[int, int]] = set()
+        addr_size_to_region_idx: dict[tuple[int, int], int] = {}
 
         # Note(tms): I modified this from the original region setup code.
         # K and V are now in different regions. Advantage is that we can
@@ -1409,77 +1455,343 @@ class NixlConnectorWorker:
         # (roughly 8KB vs 5KB).
         # Conversely for FlashInfer, K and V are registered in the same region
         # to better exploit the memory layout (ie num_blocks is the first dim).
-        tensor_size_bytes = None
+
+        # For hybrid models (Mamba + Attention), different cache types have
+        # fundamentally different "block sizes" (state shapes vs KV blocks).
+        # The _physical_blocks_per_logical_kv_block ratio should NOT be computed
+        # for hybrid models as it would produce nonsense values.
+        # Hybrid models are detected by having multiple KV cache groups.
+        is_hybrid_model = (
+            self.kv_cache_config is not None
+            and len(self.kv_cache_config.kv_cache_groups)
+            > 1  # len(self.kv_cache_config.kv_cache_groups) == 5
+        )
+        self.is_hybrid_model = is_hybrid_model
+        if is_hybrid_model:
+            logger.info_once(
+                "Hybrid model detected (%d KV cache groups). "
+                "Skipping block size ratio calculation.",
+                len(self.kv_cache_config.kv_cache_groups),
+            )
+
+        # Build layer_name -> group_index mapping for hybrid models.
+        # This is needed to track which regions belong to which KV cache group.
+        layer_to_group: dict[str, int] = {}
+        # Track layer_name -> is_mamba for slot_size calculation
+        layer_is_mamba: dict[str, bool] = {}
+        # Track layer_name -> page_size_bytes for Mamba layers
+        # This is needed to register Mamba as single contiguous regions
+        layer_mamba_page_size: dict[str, int] = {}
+        if is_hybrid_model and self.kv_cache_config is not None:
+            # Build group-to-type mapping based on kv_cache_spec type
+            spec_type_to_groups: dict[type, list[int]] = {}
+            # Store logical block size per group for later ratio calculation
+            logical_block_size_per_group: list[int] = []
+            for group_idx, group in enumerate(self.kv_cache_config.kv_cache_groups):
+                is_mamba_group = isinstance(group.kv_cache_spec, MambaSpec)
+                logical_block_size_per_group.append(group.kv_cache_spec.block_size)
+                for layer_name in group.layer_names:
+                    layer_to_group[layer_name] = group_idx
+                    layer_is_mamba[layer_name] = is_mamba_group
+                    # Store page_size_bytes for Mamba layers
+                    if is_mamba_group:
+                        layer_mamba_page_size[layer_name] = (
+                            group.kv_cache_spec.page_size_bytes
+                        )
+
+                # Track groups by spec type
+                spec_type = type(group.kv_cache_spec)
+                if spec_type not in spec_type_to_groups:
+                    spec_type_to_groups[spec_type] = []
+                spec_type_to_groups[spec_type].append(group_idx)
+            # Build sibling mapping (other groups with same spec type)
+            for groups in spec_type_to_groups.values():
+                for group_idx in groups:
+                    self.group_siblings[group_idx] = [
+                        g for g in groups if g != group_idx
+                    ]
+            # Initialize regions_per_group with empty lists for each group
+            num_groups = len(self.kv_cache_config.kv_cache_groups)
+            self.regions_per_group = [[] for _ in range(num_groups)]
+            # Initialize per-group block ratios (will be updated during tensor processing)
+            # Default to 1, will be calculated for attention groups when we see their tensors
+            self._physical_blocks_per_logical_per_group = [1] * num_groups
+            self._logical_block_size_per_group = logical_block_size_per_group
+            logger.info(
+                "Hybrid model logical block sizes per group: %s",
+                logical_block_size_per_group,
+            )
 
         # Enable different block lengths for different layers when MLA is used.
         self.block_len_per_layer = list[int]()
         self.slot_size_per_layer = list[int]()  # HD bytes in kv terms
         for layer_name, cache_or_caches in xfer_buffers.items():
-            cache_list = (
-                cache_or_caches if self.kv_topo.split_k_and_v else [cache_or_caches]
-            )
+            if isinstance(cache_or_caches, list):
+                cache_list = cache_or_caches
+            else:
+                cache_list = [cache_or_caches]
+
+            # Check if this is a Mamba layer FIRST (before per-tensor iteration)
+            is_mamba = layer_is_mamba.get(layer_name, False)
+
+            # For Mamba layers: conv_state and ssm_state are strided views into
+            # a single contiguous storage. We register the storage as ONE region
+            # with page_size_bytes as the block length. This ensures NIXL
+            # transfers the full block data including both conv and ssm states.
+            if is_mamba and len(cache_list) > 0:
+                # Get storage info from the first tensor (all share same storage)
+                first_cache = cache_list[0]
+                storage = first_cache.untyped_storage()
+                storage_base_addr = storage.data_ptr()
+                storage_size = storage.nbytes()
+
+                # Use storage address/size as key (not tensor address/size)
+                addr_size_key = (storage_base_addr, storage_size)
+                if addr_size_key in seen_addr_size_pairs:
+                    if is_hybrid_model and layer_name in layer_to_group:
+                        group_idx = layer_to_group[layer_name]
+                        region_idx = addr_size_to_region_idx.get(addr_size_key)
+                        if (
+                            region_idx is not None
+                            and region_idx not in self.regions_per_group[group_idx]
+                        ):
+                            self.regions_per_group[group_idx].append(region_idx)
+                    continue
+                seen_addr_size_pairs.add(addr_size_key)
+
+                # Get page_size_bytes from MambaSpec
+                page_size_bytes = layer_mamba_page_size.get(layer_name, 0)
+                if page_size_bytes == 0:
+                    # Fallback: compute from stride of first tensor
+                    page_size_bytes = (
+                        first_cache.stride()[0] * first_cache.element_size()
+                    )
+
+                # num_blocks is shape[0] of any tensor in the list
+                curr_num_blocks = first_cache.shape[0]
+
+                # Track region index before appending
+                region_idx = len(seen_base_addresses)
+                seen_base_addresses.append(storage_base_addr)
+                addr_size_to_region_idx[addr_size_key] = region_idx
+
+                # Track per-region block count
+                self.num_blocks_per_region.append(curr_num_blocks)
+                if (
+                    not self.num_blocks_per_region
+                    or len(self.num_blocks_per_region) == 1
+                ):
+                    self.num_blocks = curr_num_blocks
+
+                # Block length = page_size_bytes (covers both conv and ssm states)
+                self.block_len_per_layer.append(page_size_bytes)
+                self.is_mamba_region.append(True)
+                # Mamba: no "tokens per block" concept
+                self.slot_size_per_layer.append(0)
+
+                # Device ID
+                self.device_id = max(first_cache.get_device(), 0)
+
+                # Register with NIXL - use storage base addr and size
+                caches_data.append(
+                    (storage_base_addr, storage_size, self.device_id, "")
+                )
+
+                # Track which group this region belongs to (for hybrid models)
+                if is_hybrid_model and layer_name in layer_to_group:
+                    group_idx = layer_to_group[layer_name]
+                    self.regions_per_group[group_idx].append(region_idx)
+
+                logger.debug(
+                    "Registered Mamba layer %s: storage_addr=%x, storage_size=%d, "
+                    "page_size_bytes=%d, num_blocks=%d",
+                    layer_name,
+                    storage_base_addr,
+                    storage_size,
+                    page_size_bytes,
+                    curr_num_blocks,
+                )
+
+                # Skip the per-tensor loop for Mamba
+                continue
+
+            # Non-Mamba: process each tensor in the list
             for cache in cache_list:
                 base_addr = cache.data_ptr()
-                if base_addr in seen_base_addresses:
+                tensor_size = cache.numel() * cache.element_size()
+                addr_size_key = (base_addr, tensor_size)
+
+                if addr_size_key in seen_addr_size_pairs:
+                    if is_hybrid_model and layer_name in layer_to_group:
+                        group_idx = layer_to_group[layer_name]
+                        region_idx = addr_size_to_region_idx.get(addr_size_key)
+                        if (
+                            region_idx is not None
+                            and region_idx not in self.regions_per_group[group_idx]
+                        ):
+                            self.regions_per_group[group_idx].append(region_idx)
                     # NOTE (NickLucche) HMA employs memory pooling to share tensors
                     # across groups. This results in skipping all tensors but the ones
                     # pointed to by group0. Also, generally we will have more blocks
                     # per tensor but fewer regions.
+                    # NOTE: We use (base_addr, tensor_size) as key to avoid skipping
+                    # tensors that share base_addr but have different sizes (e.g.,
+                    # Attention vs Mamba caches in hybrid models with HMA).
                     continue
 
+                seen_addr_size_pairs.add(addr_size_key)
+
+                # For ATTENTION: Extract kernel_block_size from tensor shape
+                # (Mamba is handled in the outer loop above)
                 kernel_block_size = cache.shape[self.kv_topo.block_size_position]
+
                 if self.block_size != kernel_block_size:
                     logger.info_once(
                         "User-specified logical block size (%s) does not match"
-                        " physical kernel block size (%s). Using the latter. ",
+                        " physical kernel block size (%s). Using the latter.",
                         self.block_size,
                         kernel_block_size,
                     )
-                    self._physical_blocks_per_logical_kv_block = (
-                        self.block_size // kernel_block_size
-                    )
+                    # Only compute the block size ratio for non-hybrid models.
+                    if not is_hybrid_model:
+                        self._physical_blocks_per_logical_kv_block = (
+                            self.block_size // kernel_block_size
+                        )
+                    # Update block_size from Attention tensors only
                     self.block_size = kernel_block_size
                     self._block_size[self.engine_id] = kernel_block_size
 
+                # For hybrid models: calculate per-group ratio
+                if is_hybrid_model and layer_name in layer_to_group:
+                    group_idx = layer_to_group[layer_name]
+                    logical_bs = self._logical_block_size_per_group[group_idx]
+                    ratio = logical_bs // kernel_block_size
+                    if (
+                        self._physical_blocks_per_logical_per_group[group_idx] == 1
+                        and ratio > 1
+                    ):
+                        self._physical_blocks_per_logical_per_group[group_idx] = ratio
+                        logger.info(
+                            "Group %d: logical_block_size=%d, kernel_block_size=%d, ratio=%d",
+                            group_idx,
+                            logical_bs,
+                            kernel_block_size,
+                            ratio,
+                        )
+
+                # Track region index before appending
+                region_idx = len(seen_base_addresses)
+
                 seen_base_addresses.append(base_addr)
-                curr_tensor_size_bytes = cache.numel() * cache.element_size()
+                addr_size_to_region_idx[addr_size_key] = region_idx
 
-                if tensor_size_bytes is None:
-                    tensor_size_bytes = curr_tensor_size_bytes
-                    self.num_blocks = cache.shape[0]
+                # Calculate num_blocks based on memory layout
+                # For block-first layouts (FlashInfer): shape is [num_blocks, ...]
+                # For non-block-first layouts (FLASH_ATTN): shape is [2, num_tokens, ...]
+                #   where shape[0] = 2 (K and V), NOT num_blocks!
+                # (Mamba is handled in the outer loop above)
+                if self.kv_topo.is_kv_layout_blocks_first:
+                    # Block-first: shape[0] is num_blocks
+                    curr_num_blocks = cache.shape[0]
+                else:
+                    # Non-block-first Attention: shape is [2, total_tokens, num_heads, head_dim]
+                    # Calculate num_blocks = total_tokens / block_size
+                    # Note: self.block_size may have been updated to kernel_block_size above
+                    total_tokens = cache.shape[1] * cache.shape[2]
+                    curr_num_blocks = total_tokens // self.block_size
+                    logger.debug(
+                        "Non-block-first attention: total_tokens=%d, block_size=%d, "
+                        "num_blocks=%d",
+                        total_tokens,
+                        self.block_size,
+                        curr_num_blocks,
+                    )
 
-                assert cache.shape[0] == self.num_blocks, (
-                    "All kv cache tensors must have the same number of blocks"
-                )
+                # Track per-region block count for hybrid models
+                self.num_blocks_per_region.append(curr_num_blocks)
 
-                self.block_len_per_layer.append(
-                    curr_tensor_size_bytes // self.num_blocks
-                )
+                # Set self.num_blocks from the first region (for backward compat)
+                if (
+                    not self.num_blocks_per_region
+                    or len(self.num_blocks_per_region) == 1
+                ):
+                    self.num_blocks = curr_num_blocks
+
+                # For hybrid models, different cache types have different block counts.
+                # Only assert for non-hybrid models where all caches should match.
+                if not is_hybrid_model:
+                    assert curr_num_blocks == self.num_blocks, (
+                        "All kv cache tensors must have the same number of blocks"
+                    )
+
+                # Block length in bytes (different for each cache type in hybrid models)
+                self.block_len_per_layer.append(tensor_size // curr_num_blocks)
+
+                # Track if this region is Mamba (state) vs Attention (KV)
+                # (This loop only handles non-Mamba layers; Mamba handled above)
+                self.is_mamba_region.append(False)
+
+                # slot_size = bytes per token slot (block_len / tokens_per_block)
+                # For Attention: block_len / block_size gives HD bytes per token
                 self.slot_size_per_layer.append(
                     self.block_len_per_layer[-1] // self.block_size
                 )
 
-                if not self.use_mla:
-                    # Different kv cache shape is not supported by HeteroTP
-                    assert tensor_size_bytes == curr_tensor_size_bytes, (
-                        "All kv cache tensors must have the same size"
-                    )
                 # Need to make sure the device ID is non-negative for NIXL,
                 # Torch uses -1 to indicate CPU tensors.
                 self.device_id = max(cache.get_device(), 0)
-                caches_data.append(
-                    (base_addr, curr_tensor_size_bytes, self.device_id, "")
-                )
+                # Register with NIXL as a "region"
+                caches_data.append((base_addr, tensor_size, self.device_id, ""))
+
+                # Track which group this region belongs to (for hybrid models)
+                if is_hybrid_model and layer_name in layer_to_group:
+                    group_idx = layer_to_group[layer_name]
+                    self.regions_per_group[group_idx].append(region_idx)
 
         logger.debug(
             "Different block lengths collected: %s", set(self.block_len_per_layer)
         )
-        assert len(self.block_len_per_layer) == len(seen_base_addresses)
+
+        assert len(caches_data) == len(seen_base_addresses)
         assert self.num_blocks != 0
+
+        # Compute cumulative offsets for descriptor ID calculation.
+        # For hybrid models with variable block counts per region, the formula
+        # desc_id = region_id * num_blocks + block_id doesn't work.
+        # Instead we use: desc_id = region_block_offsets[region_id] + block_id
+        cumulative = 0
+        for num_blks in self.num_blocks_per_region:
+            self.region_block_offsets.append(cumulative)
+            cumulative += num_blks
+
+        if is_hybrid_model:
+            logger.debug(
+                "Hybrid model region info: num_blocks_per_region=%s, "
+                "region_block_offsets=%s",
+                self.num_blocks_per_region[:5],
+                self.region_block_offsets[:5],
+            )
 
         self.kv_caches_base_addr[self.engine_id][self.tp_rank] = seen_base_addresses
         self.num_regions = len(caches_data)
         self.num_layers = len(xfer_buffers.keys())
+
+        # Save pre-FlashInfer-doubling values for descriptor registration.
+        # FlashInfer doubling creates virtual K/V regions, but physical
+        # descriptor registration should use the original per-tensor block counts.
+        self._physical_num_blocks_per_region = list(self.num_blocks_per_region)
+        self._physical_region_block_offsets = list(self.region_block_offsets)
+        self._physical_is_mamba_region = list(self.is_mamba_region)
+
+        if is_hybrid_model:
+            logger.info(
+                "NIXL KV cache registration: %d regions, %d layers, "
+                "block_size=%d, is_hybrid=%s",
+                len(caches_data),
+                self.num_layers,
+                self.block_size,
+                is_hybrid_model,
+            )
 
         descs = self.nixl_wrapper.get_reg_descs(caches_data, self.nixl_memory_type)
         logger.debug("Registering descs: %s", caches_data)
@@ -1491,25 +1803,112 @@ class NixlConnectorWorker:
         self.dst_num_blocks[self.engine_id] = self.num_blocks
 
         if self.kv_topo.is_kv_layout_blocks_first:
+            # Halve slot_size for Attention regions only (K/V split).
+            # Skip Mamba regions - they don't have K/V split concept.
             for i in range(len(self.slot_size_per_layer)):
-                assert self.slot_size_per_layer[i] % 2 == 0
+                if self.is_mamba_region[i]:
+                    # Mamba: slot_size is 0, no halving needed
+                    continue
+                assert self.slot_size_per_layer[i] % 2 == 0, (
+                    f"Attention region {i} slot_size must be even for K/V split"
+                )
                 self.slot_size_per_layer[i] //= 2
 
             # NOTE (NickLucche) When FlashInfer is used, memory is registered
             # with joint KV for each block. This minimizes the overhead in
             # registerMem allowing faster descs queries. In order to be able to
             # split on kv_heads dim as required by heterogeneous TP, one must
-            # be able to index K/V separately. Hence we double the number
-            # of 'virtual' regions here and halve `block_len` below.
-            self.num_regions *= 2
+            # be able to index K/V separately. For Attention regions, we double
+            # the number of 'virtual' regions (K and V). Mamba regions stay 1:1
+            # since they don't have K/V split.
+
+            # For FlashInfer, double the per-region block counts and offsets
+            # ONLY for Attention regions. Mamba regions don't have K/V split
+            # so they weren't doubled during descriptor registration.
+            physical_to_virtual_region: dict[int, list[int]] = {}
+            if self.num_blocks_per_region:
+                new_num_blocks_per_region: list[int] = []
+                new_is_mamba_region: list[bool] = []
+                virtual_idx = 0
+
+                for idx, num_blks in enumerate(self.num_blocks_per_region):
+                    is_mamba = (
+                        self.is_mamba_region[idx]
+                        if idx < len(self.is_mamba_region)
+                        else False
+                    )
+
+                    if is_mamba:
+                        # Mamba: single region (no K/V split)
+                        new_num_blocks_per_region.append(num_blks)
+                        new_is_mamba_region.append(True)
+                        physical_to_virtual_region[idx] = [virtual_idx]
+                        virtual_idx += 1
+                    else:
+                        # Attention: K region and V region (both have same block count)
+                        new_num_blocks_per_region.extend([num_blks, num_blks])
+                        new_is_mamba_region.extend([False, False])
+                        physical_to_virtual_region[idx] = [virtual_idx, virtual_idx + 1]
+                        virtual_idx += 2
+
+                self.num_blocks_per_region = new_num_blocks_per_region
+                self.is_mamba_region = new_is_mamba_region
+                self.num_regions = len(new_num_blocks_per_region)
+
+                # Recompute cumulative offsets for the virtual regions
+                self.region_block_offsets = []
+                cumulative = 0
+                for num_blks in self.num_blocks_per_region:
+                    self.region_block_offsets.append(cumulative)
+                    cumulative += num_blks
+
+                # For hybrid models with FlashInfer, remap region indices using
+                # the physical-to-virtual mapping. Mamba regions stay 1:1,
+                # Attention regions become 2 virtual regions (K and V).
+                if is_hybrid_model:
+                    new_regions_per_group: list[list[int]] = []
+                    for group_regions in self.regions_per_group:
+                        new_regions: list[int] = []
+                        for phys_r in group_regions:
+                            if phys_r in physical_to_virtual_region:
+                                new_regions.extend(physical_to_virtual_region[phys_r])
+                            else:
+                                # Fallback: just use physical index
+                                new_regions.append(phys_r)
+                        new_regions_per_group.append(new_regions)
+                    self.regions_per_group = new_regions_per_group
+
+        # Log region-to-group mapping for hybrid models
+        if is_hybrid_model:
+            logger.info(
+                "Hybrid model region mapping: %d groups, regions_per_group=%s, "
+                "group_siblings=%s, num_regions=%d",
+                len(self.regions_per_group),
+                [len(r) for r in self.regions_per_group],
+                self.group_siblings,
+                self.num_regions,
+            )
 
         # Register local/src descr for NIXL xfer.
         self.seen_base_addresses = seen_base_addresses
+        logger.debug(
+            "pass to register_local_xfer_handler block_size: %d", self.block_size
+        )
         self.src_xfer_handles_by_block_size[self.block_size], self.src_blocks_data = (
             self.register_local_xfer_handler(self.block_size)
         )
 
         # After KV Caches registered, listen for new connections.
+        # For hybrid models, include per-region block counts in metadata.
+        # Use _physical_num_blocks_per_region (pre-FlashInfer-doubling) so
+        # remote agents register the correct number of descriptors per region.
+        physical_blocks_per_region = getattr(
+            self, "_physical_num_blocks_per_region", None
+        )
+        # Include which regions are Mamba (state) vs Attention (KV).
+        # Use _physical_is_mamba_region (pre-FlashInfer-doubling) so remote
+        # agents know which regions to skip V-cache descriptors for.
+        physical_is_mamba_region = getattr(self, "_physical_is_mamba_region", None)
         agent_metadata = NixlAgentMetadata(
             engine_id=self.engine_id,
             agent_metadata=self.nixl_wrapper.get_agent_metadata(),
@@ -1521,6 +1920,8 @@ class NixlConnectorWorker:
             if not self.use_host_buffer
             else self.host_buffer_kv_cache_layout,
             block_size=self.block_size,
+            num_blocks_per_region=physical_blocks_per_region,
+            is_mamba_region=physical_is_mamba_region,
         )
         # Wrap metadata in payload with hash for defensive decoding
         assert self.compat_hash is not None
@@ -1549,21 +1950,64 @@ class NixlConnectorWorker:
 
         block_size_ratio = self.block_size // block_size
         blocks_data = []
+        # Use physical (pre-FlashInfer-doubling) block counts for total calculation
+        physical_blocks_per_region = getattr(
+            self, "_physical_num_blocks_per_region", self.num_blocks_per_region
+        )
+        total_blocks = (
+            sum(physical_blocks_per_region)
+            if physical_blocks_per_region
+            else self.num_blocks * len(self.seen_base_addresses)
+        )
+        logger.debug(
+            "register_local_xfer_handler: %d base_addresses, %d total_blocks, "
+            "is_kv_layout_blocks_first=%s",
+            len(self.seen_base_addresses),
+            total_blocks,
+            self.kv_topo.is_kv_layout_blocks_first,
+        )
+
         for i, base_addr in enumerate(self.seen_base_addresses):
             # The new block_len is using prefill block_len;
-            # and num_blocks is multiple with N
+            # and num_blocks is specific to this region (for hybrid models)
             kv_block_len = (
                 self.get_backend_aware_kv_block_len(layer_idx=i) // block_size_ratio
             )
             block_len_per_layer = self.block_len_per_layer[i] // block_size_ratio
-            num_blocks = self.num_blocks * block_size_ratio
+            # Use per-region block count for hybrid models.
+            # IMPORTANT: Use _physical_num_blocks_per_region (pre-FlashInfer-doubling)
+            # because we're iterating through physical tensors, not virtual K/V regions.
+            physical_blocks_per_region = getattr(
+                self, "_physical_num_blocks_per_region", self.num_blocks_per_region
+            )
+            num_blocks = (
+                physical_blocks_per_region[i] * block_size_ratio
+                if physical_blocks_per_region
+                else self.num_blocks * block_size_ratio
+            )
+
+            # Check if this is a Mamba region
+            # IMPORTANT: Use _physical_is_mamba_region (pre-FlashInfer-doubling)
+            # because we're iterating through physical tensors (seen_base_addresses),
+            # not virtual K/V regions.
+            physical_is_mamba = getattr(
+                self, "_physical_is_mamba_region", self.is_mamba_region
+            )
+            is_mamba = (
+                physical_is_mamba
+                and i < len(physical_is_mamba)
+                and physical_is_mamba[i]
+            )
+
             for block_id in range(num_blocks):
                 block_offset = block_id * block_len_per_layer
                 addr = base_addr + block_offset
                 # (addr, len, device id)
                 blocks_data.append((addr, kv_block_len, self.device_id))
 
-            if self.kv_topo.is_kv_layout_blocks_first:
+            # For FlashInfer: Register V cache addresses (K already registered above)
+            # Skip for Mamba regions - they don't have K/V split
+            if self.kv_topo.is_kv_layout_blocks_first and not is_mamba:
                 # Separate and interleave K/V regions to maintain the same
                 # descs ordering. This is needed for selecting contiguous heads
                 # when split across TP ranks.
@@ -1573,6 +2017,7 @@ class NixlConnectorWorker:
                     # Register addresses for V cache (K registered first).
                     v_addr = addr + kv_block_len
                     blocks_data.append((v_addr, kv_block_len, self.device_id))
+
         logger.debug(
             "Created %s blocks for src engine %s and rank %s on device id %s",
             len(blocks_data),
@@ -1582,6 +2027,9 @@ class NixlConnectorWorker:
         )
 
         descs = self.nixl_wrapper.get_xfer_descs(blocks_data, self.nixl_memory_type)
+        logger.debug(
+            "register_local_xfer_handler: created %d descriptors", len(blocks_data)
+        )
         # NIXL_INIT_AGENT to be used for preparations of local descs.
         return self.nixl_wrapper.prep_xfer_dlist("NIXL_INIT_AGENT", descs), blocks_data
 
@@ -1720,6 +2168,7 @@ class NixlConnectorWorker:
         # Eg. PTP1 DTP2 => P0 KV:[block0-KV_0 | block0-KV_1..].
 
         # Register all remote blocks, but only the corresponding kv heads.
+        # For hybrid models, use per-region block counts; otherwise use single value.
         for i, base_addr in enumerate(nixl_agent_meta.kv_caches_base_addr):
             # Read our whole local region size from remote.
             local_block_len = self.get_backend_aware_kv_block_len(layer_idx=i)
@@ -1736,7 +2185,23 @@ class NixlConnectorWorker:
                 if indexes_into_remote
                 else 0
             )
-            for block_id in range(nixl_agent_meta.num_blocks):
+            # Get block count for this specific region (for hybrid models).
+            # Fall back to global num_blocks for non-hybrid models.
+            if nixl_agent_meta.num_blocks_per_region is not None and i < len(
+                nixl_agent_meta.num_blocks_per_region
+            ):
+                region_num_blocks = nixl_agent_meta.num_blocks_per_region[i]
+            else:
+                region_num_blocks = nixl_agent_meta.num_blocks
+
+            # Check if this is a Mamba region - Mamba doesn't have K/V split
+            is_mamba = (
+                nixl_agent_meta.is_mamba_region is not None
+                and i < len(nixl_agent_meta.is_mamba_region)
+                and nixl_agent_meta.is_mamba_region[i]
+            )
+
+            for block_id in range(region_num_blocks):
                 block_offset = block_id * nixl_agent_meta.block_lens[i]
                 # For each block, grab the heads chunk belonging to rank_i
                 # of size remote_nheads // tp_ratio, which correspond to
@@ -1745,9 +2210,11 @@ class NixlConnectorWorker:
                 # (addr, len, device id)
                 blocks_data.append((addr, local_block_len, nixl_agent_meta.device_id))
 
-            if self.kv_topo.is_kv_layout_blocks_first:
+            # For FlashInfer: Register V cache addresses (K already registered above)
+            # Skip Mamba regions - they don't have K/V split
+            if self.kv_topo.is_kv_layout_blocks_first and not is_mamba:
                 # With FlashInfer index V separately to allow head splitting.
-                for block_id in range(nixl_agent_meta.num_blocks):
+                for block_id in range(region_num_blocks):
                     block_offset = block_id * nixl_agent_meta.block_lens[i]
                     addr = base_addr + block_offset + rank_offset
                     v_addr = addr + nixl_agent_meta.block_lens[i] // 2
@@ -1840,10 +2307,14 @@ class NixlConnectorWorker:
                 ), "KV cache sizes must match between P and D when replicated"
         else:
             # When MLA is not used, this is a list of the same block length
-            for block_len in nixl_agent_meta.block_lens:
-                assert block_len == remote_block_len, (
-                    "All remote layers must have the same block size"
-                )
+            # NOTE: For hybrid models (e.g., Mamba+Attention), different layer
+            # types have different block sizes, so we skip the uniform check.
+            # The validation per-layer type should be done elsewhere if needed.
+            # for block_len in nixl_agent_meta.block_lens:
+            #     assert block_len == remote_block_len, (
+            #         "All remote layers must have the same block size"
+            #     )
+            pass
 
             if tp_ratio > 0:
                 # Remote tp is smaller: remote block_len size is bigger
@@ -2449,21 +2920,88 @@ class NixlConnectorWorker:
         When HMA is enabled number of descriptors across kv cache groups might differ.
         A single flattened array is returned for all groups anyway.
         """
-        region_ids = np.arange(self.num_regions)
-        # NOTE (NickLucche) With HMA, every kv group has the same number of layers and
-        # layers from different groups share the same kv tensor.
-        # eg block_ids=[[1, 2], [3]]->blocks [1, 2] need to be read across all regions,
-        # same for [3], but group0-group1 blocks will always differ (different areas).
-        # Therefore we can just flatten the block_ids and compute the descs ids for all
-        # groups at once.
         num_blocks = self.dst_num_blocks[engine_id]
         if block_size_ratio is not None:
             num_blocks = int(num_blocks * block_size_ratio)
 
+        # Check if block_ids is grouped (tuple/list of lists) vs flat (list of ints)
+        is_grouped = (
+            isinstance(block_ids, (tuple, list))
+            and len(block_ids) > 0
+            and isinstance(block_ids[0], (list, tuple))
+        )
+
+        # For hybrid models with grouped block_ids, we must generate descriptors
+        # PER-GROUP to avoid cross-pool contamination. Each group's blocks should
+        # only map to that group's regions (or its sibling's regions if empty due to HMA).
+        #
+        # Example with Mamba (groups 0-3, regions 0-11) and Attention (group 4, regions 12-17):
+        # - Mamba blocks [1,2,3,4] -> only regions 0-11 (not 12-17!)
+        # - Attention blocks [1305-1309] -> only regions 12-17 (not 0-11!)
+        #
+        # The flat "all regions × all blocks" approach causes cross-contamination where
+        # (Mamba region, Attention block) points to a random Mamba block from another request.
+        if is_grouped and self.is_hybrid_model and self.regions_per_group:
+            # Per-group descriptor generation for hybrid models
+            all_descs = []
+
+            for group_idx, group_blocks in enumerate(block_ids):
+                if not group_blocks:
+                    continue
+
+                # Get regions for this group (regions_per_group is a list)
+                regions = (
+                    self.regions_per_group[group_idx]
+                    if group_idx < len(self.regions_per_group)
+                    else []
+                )
+
+                # If empty (due to HMA pooling), use the primary sibling's regions
+                if not regions and group_idx in self.group_siblings:
+                    for sibling_idx in self.group_siblings[group_idx]:
+                        sibling_regions = (
+                            self.regions_per_group[sibling_idx]
+                            if sibling_idx < len(self.regions_per_group)
+                            else []
+                        )
+                        if sibling_regions:
+                            regions = sibling_regions
+                            break
+
+                if not regions:
+                    continue
+
+                # Generate descriptors for this group's regions × this group's blocks
+                group_blocks_arr = np.array(group_blocks)
+                for region_idx in regions:
+                    offset = self.region_block_offsets[region_idx]
+                    descs = offset + group_blocks_arr
+                    all_descs.append(descs)
+
+            if all_descs:
+                result = np.concatenate(all_descs)
+            else:
+                result = np.array([], dtype=np.int64)
+            return result
+
+        # Non-hybrid model or flat block_ids: all regions × all blocks
+        region_ids = np.arange(self.num_regions)
+
+        # Handle both flat list and tuple of lists.
+        if is_grouped:
+            block_ids_flat = np.concatenate(block_ids)
+        else:
+            block_ids_flat = np.asarray(block_ids)
+
         # Compute the desc ids for each block.
         region_ids = region_ids[:, None]
-        block_ids = np.concatenate(block_ids)[None, :]
-        descs_ids = region_ids * num_blocks + block_ids
+        block_ids_2d = block_ids_flat[None, :]
+
+        if self.region_block_offsets and len(set(self.num_blocks_per_region)) > 1:
+            region_offsets = np.array(self.region_block_offsets)[:, None]
+            descs_ids = region_offsets + block_ids_2d
+        else:
+            descs_ids = region_ids * num_blocks + block_ids_2d
         return descs_ids.flatten()
 
     def _logical_to_kernel_block_ids(self, block_ids: BlockIds) -> BlockIds:
@@ -2471,7 +3009,35 @@ class NixlConnectorWorker:
         Convert logical block ids to kernel physical block ids.
         This is required when the logical block size (the one set by the user)
         does not match the one required by the attn backend.
+
+        For hybrid models (Mamba + Attention), different groups have different
+        logical-to-kernel block ratios:
+        - Mamba groups: ratio = 1 (no conversion needed)
+        - Attention groups: ratio = logical_block_size / kernel_block_size
         """
+        # For hybrid models with per-group ratios
+        if self._physical_blocks_per_logical_per_group:
+            result = []
+            for group_idx, group_block_ids in enumerate(block_ids):
+                ratio = (
+                    self._physical_blocks_per_logical_per_group[group_idx]
+                    if group_idx < len(self._physical_blocks_per_logical_per_group)
+                    else 1
+                )
+                if ratio == 1 or not group_block_ids:
+                    # No conversion needed for Mamba or empty groups
+                    result.append(group_block_ids)
+                else:
+                    # Convert logical → kernel for this group
+                    block_ids_np = np.array(group_block_ids)
+                    block_arange = np.arange(0, ratio).reshape(1, -1)
+                    kernel_ids = BlockTable.map_to_kernel_blocks(
+                        block_ids_np, ratio, block_arange
+                    )
+                    result.append(kernel_ids.tolist())
+            return tuple(result)
+
+        # Non-hybrid model: use global ratio
         if self._physical_blocks_per_logical_kv_block == 1:
             # Noop when physical and logical block sizes are the same
             return block_ids
@@ -2495,8 +3061,19 @@ class NixlConnectorWorker:
         block, as K and V are in separate regions.
         For FlashInfer, this is half the length of the whole block, as K and V
         share the same region.
+        For Mamba, always return the full block length (no K/V split).
         """
         assert self.kv_topo is not None
+        # Mamba regions don't have K/V split - return full block length
+        # IMPORTANT: Use _physical_is_mamba_region (pre-FlashInfer-doubling)
+        # because layer_idx corresponds to physical tensors, not virtual K/V regions.
+        physical_is_mamba = getattr(
+            self, "_physical_is_mamba_region", self.is_mamba_region
+        )
+        if physical_is_mamba and layer_idx < len(physical_is_mamba):
+            if physical_is_mamba[layer_idx]:
+                return self.block_len_per_layer[layer_idx]
+
         if self.kv_topo.is_kv_layout_blocks_first:
             # For indexing only half (either just the K or V part).
             block_len = self.block_len_per_layer[layer_idx] // 2
