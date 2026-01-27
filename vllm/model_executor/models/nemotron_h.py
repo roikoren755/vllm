@@ -149,7 +149,6 @@ class NemotronHMoE(nn.Module):
             config.hidden_size,
             config.n_routed_experts,
             bias=False,
-            params_dtype=torch.float32,
             quant_config=None,
             prefix=f"{prefix}.gate",
         )
@@ -241,7 +240,7 @@ class NemotronHMoE(nn.Module):
             hidden_states = sequence_parallel_chunk(hidden_states)
 
         # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states.to(dtype=torch.float32))
+        router_logits, _ = self.gate(hidden_states)
         shared_output = None
         if self.use_latent_moe:
             if self.shared_experts is not None:
