@@ -19,6 +19,9 @@ from vllm.distributed.ec_transfer.ec_connector.base import (
 from vllm.distributed.ec_transfer.ec_connector.factory import ECConnectorFactory
 from vllm.distributed.kv_events import EventPublisherFactory, KVEventBatch
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
+from vllm.distributed.kv_transfer.kv_connector.utils import (
+    get_full_attention_group_idx,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1 import (
     KVConnectorBase_V1,
     KVConnectorRole,
@@ -112,6 +115,7 @@ class Scheduler(SchedulerInterface):
         self.connector = None
         self.connector_prefix_cache_stats: PrefixCacheStats | None = None
         self.recompute_kv_load_failures = True
+        self._full_attention_group_idx = 0
         if self.vllm_config.kv_transfer_config is not None:
             assert not self.is_encoder_decoder, (
                 "Encoder-decoder models are not currently supported with KV connectors"
@@ -127,6 +131,9 @@ class Scheduler(SchedulerInterface):
                 self.vllm_config.kv_transfer_config.kv_load_failure_policy
             )
             self.recompute_kv_load_failures = kv_load_failure_policy == "recompute"
+            self._full_attention_group_idx = get_full_attention_group_idx(
+                kv_cache_config
+            )
 
         self.kv_event_publisher = EventPublisherFactory.create(
             self.kv_events_config,
@@ -1911,9 +1918,23 @@ class Scheduler(SchedulerInterface):
             self.failed_recving_kv_req_ids.remove(request.request_id)
         else:
             # Now that the blocks are ready, actually cache them.
-            (block_ids,) = self.kv_cache_manager.get_block_ids(request.request_id)
-            num_computed_tokens = len(block_ids) * self.block_size
-            # Handle the case where num request tokens less than one block.
+            block_ids = self.kv_cache_manager.get_block_ids(request.request_id)
+
+            # For hybrid models with different block sizes per KV cache group,
+            # we use num_prefilled_tokens from kv_transfer_params if available.
+            # This is more accurate than calculating from block counts.
+            kv_params = request.kv_transfer_params
+            if kv_params and "num_prefilled_tokens" in kv_params:
+                # Use the exact token count from prefill side
+                num_computed_tokens = kv_params["num_prefilled_tokens"]
+            else:
+                # When connector does not support HMA, a single group is present here
+                num_computed_tokens = (
+                    len(block_ids[self._full_attention_group_idx]) * self.block_size
+                )
+
+            # Get number of blocks on full attention layer, we can retrieve at most
+            # this many tokens
             num_computed_tokens = min(num_computed_tokens, request.num_tokens)
             if num_computed_tokens == request.num_tokens:
                 num_computed_tokens -= 1
@@ -1990,8 +2011,11 @@ class Scheduler(SchedulerInterface):
             is_affected = False
             marked_invalid_block = False
             req_id = request.request_id
-            # TODO (davidb): add support for hybrid memory allocator
-            (req_block_ids,) = self.kv_cache_manager.get_block_ids(req_id)
+            req_block_ids = self.kv_cache_manager.get_block_ids(req_id)
+            # Assume FA group is present to infer number of computed tokens
+            # TODO this is not padded for SW right?
+            fa_blocks = req_block_ids[self._full_attention_group_idx]
+            max_num_blocks = len(fa_blocks)
             # We iterate only over blocks that may contain externally computed
             # tokens
             if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
@@ -2000,7 +2024,7 @@ class Scheduler(SchedulerInterface):
                 req_num_computed_tokens = (
                     request.num_computed_tokens
                     if req_id in self.failed_recving_kv_req_ids
-                    else len(req_block_ids) * self.block_size
+                    else max_num_blocks * self.block_size
                 )
             else:
                 # Sync loading. num_computed_tokens includes new tokens
@@ -2009,7 +2033,9 @@ class Scheduler(SchedulerInterface):
             req_num_computed_blocks = (
                 req_num_computed_tokens + self.block_size - 1
             ) // self.block_size
-            for idx, block_id in zip(range(req_num_computed_blocks), req_block_ids):
+            # For the purpose of marking blocks as invalid, only report FA ones to
+            # handle blocks<>tokens mapping consistently.
+            for idx, block_id in zip(range(req_num_computed_blocks), fa_blocks):
                 if block_id not in invalid_block_ids:
                     continue
 
@@ -2039,9 +2065,17 @@ class Scheduler(SchedulerInterface):
                 )
                 total_affected_tokens += num_affected_tokens
                 request.num_external_computed_tokens -= num_affected_tokens
-                # collect invalid block and all downstream dependent blocks
+                # Collect invalid block and all downstream dependent blocks, across
+                # all groups.
                 if evict_blocks:
-                    blocks_to_evict.update(req_block_ids[idx:])
+                    # Assuming groups are not padded, do SW-aware eviction, example:
+                    # FA: [A B C D C]
+                    # SW: [      E F]
+                    # =>Evict E only when failure index <= E.
+                    for group in req_block_ids:
+                        offset = max_num_blocks - len(group)
+                        start_idx = max(0, idx - offset)
+                        blocks_to_evict.update(group[start_idx:])
 
             if is_affected:
                 if not marked_invalid_block:
