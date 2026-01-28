@@ -145,12 +145,10 @@ class NemotronHMoE(nn.Module):
 
         self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
 
-        router_logits_dtype = torch.float32
         self.gate = ReplicatedLinear(
             config.hidden_size,
             config.n_routed_experts,
             bias=False,
-            params_dtype=router_logits_dtype,
             quant_config=None,
             prefix=f"{prefix}.gate",
         )
@@ -210,7 +208,6 @@ class NemotronHMoE(nn.Module):
             enable_eplb=self.enable_eplb,
             num_redundant_experts=self.n_redundant_experts,
             is_sequence_parallel=self.is_sequence_parallel,
-            router_logits_dtype=router_logits_dtype,
         )
 
         if self.use_latent_moe:
@@ -243,7 +240,7 @@ class NemotronHMoE(nn.Module):
             hidden_states = sequence_parallel_chunk(hidden_states)
 
         # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states.to(dtype=torch.float32))
+        router_logits, _ = self.gate(hidden_states)
         shared_output = None
         if self.use_latent_moe:
             if self.shared_experts is not None:
