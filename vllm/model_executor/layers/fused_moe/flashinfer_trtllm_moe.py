@@ -36,7 +36,7 @@ def _supports_current_device() -> bool:
 
 def _supports_no_act_and_mul() -> bool:
     """Does not support non-gated MoE (i.e. Nanotron-Mini)."""
-    return False
+    return True
 
 
 def _supports_quant_scheme(
@@ -53,7 +53,7 @@ def _supports_quant_scheme(
 
 def _supports_activation(activation: str) -> bool:
     """Supports silu activation only."""
-    return activation in ["silu"]
+    return activation in ["silu", "relu2_no_mul"]
 
 
 def _supports_routing_method(
@@ -71,7 +71,7 @@ def _supports_routing_method(
         ]
     elif (weight_key, activation_key) == (kFp8StaticTensorSym, kFp8StaticTensorSym):
         # NOTE(rob): kernel requires Llama4.
-        return routing_method == RoutingMethodType.Llama4
+        return routing_method == RoutingMethodType.Llama4 or routing_method == RoutingMethodType.DeepSeekV3
 
     else:
         raise ValueError("Unsupported quantization scheme.")

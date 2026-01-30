@@ -59,7 +59,7 @@ def _supports_current_device() -> bool:
 
 def _supports_no_act_and_mul() -> bool:
     """Does not support non-gated MoE (i.e. Nemotron-Nano)."""
-    return False
+    return True
 
 
 def _supports_quant_scheme(
@@ -75,7 +75,7 @@ def _supports_quant_scheme(
 
 def _supports_activation(activation: str) -> bool:
     """Supports silu activation only."""
-    return activation in ["silu"]
+    return activation in ["silu", "relu2_no_mul"]
 
 
 def _supports_routing_method(
