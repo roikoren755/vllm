@@ -936,7 +936,7 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
         return apply_fi_trtllm_fp8_per_tensor_moe(
             layer=layer,
             hidden_states=x,
-            router_logits=router_logits,
+            router_logits=router_logits.to(dtype=torch.float32),
             routing_bias=layer.e_score_correction_bias,
             global_num_experts=layer.global_num_experts,
             top_k=layer.top_k,
@@ -1514,7 +1514,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         return flashinfer_trtllm_fp4_moe(
             layer=layer,
             x=x,
-            router_logits=router_logits,
+            router_logits=router_logits.to(dtype=torch.float32),
             top_k=layer.top_k,
             activation=layer.activation,
             global_num_experts=layer.global_num_experts,
