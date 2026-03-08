@@ -36,6 +36,16 @@ class MambaConfig:
     backend: MambaBackendEnum | None = None
     """Mamba SSU backend to use. If None, defaults to triton."""
 
+    enable_stochastic_rounding: bool = False
+    """Enable stochastic rounding when writing SSM state to fp16 cache.
+    Uses random bits to unbias the rounding error, which can improve
+    numerical stability for long sequences."""
+
+    philox_rounds: int = 0
+    """Number of Philox PRNG rounds for stochastic rounding random number
+    generation. 0 uses the Triton default. Higher values improve randomness
+    quality at the cost of compute."""
+
     @field_validator("backend", mode="before")
     @classmethod
     def validate_backend_before(cls, value: Any) -> Any:

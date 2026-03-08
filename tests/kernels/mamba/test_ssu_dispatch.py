@@ -4,7 +4,7 @@
 import pytest
 import torch
 
-from vllm.config.mamba import MambaBackendEnum
+from vllm.config.mamba import MambaBackendEnum, MambaConfig
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     FlashInferSSUBackend,
     TritonSSUBackend,
@@ -21,22 +21,26 @@ except ImportError:
     HAS_FLASHINFER = False
 
 
+def _make_config(backend=None, **kwargs):
+    return MambaConfig(backend=backend, **kwargs)
+
+
 def test_default_backend_is_triton():
-    initialize_mamba_ssu_backend(None)
+    initialize_mamba_ssu_backend(_make_config())
     backend = get_mamba_ssu_backend()
     assert isinstance(backend, TritonSSUBackend)
     assert backend.name == "triton"
 
 
 def test_explicit_triton_backend():
-    initialize_mamba_ssu_backend(MambaBackendEnum.TRITON)
+    initialize_mamba_ssu_backend(_make_config(MambaBackendEnum.TRITON))
     backend = get_mamba_ssu_backend()
     assert isinstance(backend, TritonSSUBackend)
 
 
 @pytest.mark.skipif(not HAS_FLASHINFER, reason="flashinfer not installed")
 def test_flashinfer_backend_init():
-    initialize_mamba_ssu_backend(MambaBackendEnum.FLASHINFER)
+    initialize_mamba_ssu_backend(_make_config(MambaBackendEnum.FLASHINFER))
     backend = get_mamba_ssu_backend()
     assert isinstance(backend, FlashInferSSUBackend)
     assert backend.name == "flashinfer"
@@ -53,8 +57,16 @@ def test_uninitialized_backend_raises():
 
 
 @pytest.mark.skipif(not HAS_FLASHINFER, reason="flashinfer not installed")
+def test_flashinfer_stochastic_rounding_raises():
+    with pytest.raises(ValueError, match="stochastic rounding"):
+        initialize_mamba_ssu_backend(
+            _make_config(MambaBackendEnum.FLASHINFER, enable_stochastic_rounding=True)
+        )
+
+
+@pytest.mark.skipif(not HAS_FLASHINFER, reason="flashinfer not installed")
 def test_flashinfer_dst_state_batch_indices_raises():
-    initialize_mamba_ssu_backend(MambaBackendEnum.FLASHINFER)
+    initialize_mamba_ssu_backend(_make_config(MambaBackendEnum.FLASHINFER))
     device = "cuda"
     state = torch.randn(1, 64, 16, device=device)
     x = torch.randn(1, 64, device=device)
@@ -82,7 +94,7 @@ def test_flashinfer_dst_state_batch_indices_raises():
 
 @pytest.mark.skipif(not HAS_FLASHINFER, reason="flashinfer not installed")
 def test_flashinfer_num_accepted_tokens_raises():
-    initialize_mamba_ssu_backend(MambaBackendEnum.FLASHINFER)
+    initialize_mamba_ssu_backend(_make_config(MambaBackendEnum.FLASHINFER))
     device = "cuda"
     state = torch.randn(1, 64, 16, device=device)
     x = torch.randn(1, 64, device=device)
@@ -110,7 +122,7 @@ def test_flashinfer_num_accepted_tokens_raises():
 
 @pytest.mark.skipif(not HAS_FLASHINFER, reason="flashinfer not installed")
 def test_flashinfer_cu_seqlens_raises():
-    initialize_mamba_ssu_backend(MambaBackendEnum.FLASHINFER)
+    initialize_mamba_ssu_backend(_make_config(MambaBackendEnum.FLASHINFER))
     device = "cuda"
     state = torch.randn(1, 64, 16, device=device)
     x = torch.randn(1, 64, device=device)
@@ -139,11 +151,11 @@ def test_flashinfer_cu_seqlens_raises():
 @pytest.mark.skipif(HAS_FLASHINFER, reason="flashinfer is installed")
 def test_flashinfer_import_error():
     with pytest.raises(ImportError, match="FlashInfer is required"):
-        FlashInferSSUBackend()
+        FlashInferSSUBackend(_make_config())
 
 
 def test_triton_basic_call():
-    initialize_mamba_ssu_backend(MambaBackendEnum.TRITON)
+    initialize_mamba_ssu_backend(_make_config(MambaBackendEnum.TRITON))
     device = "cuda"
     batch_size = 2
     dim = 64

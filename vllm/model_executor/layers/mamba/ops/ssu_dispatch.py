@@ -12,7 +12,7 @@ from abc import ABC, abstractmethod
 
 import torch
 
-from vllm.config.mamba import MambaBackendEnum
+from vllm.config.mamba import MambaBackendEnum, MambaConfig
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
@@ -21,6 +21,9 @@ logger = init_logger(__name__)
 
 class MambaSSUBackend(ABC):
     """Abstract base class for Mamba SSU backends."""
+
+    @abstractmethod
+    def __init__(self, mamba_config: MambaConfig) -> None: ...
 
     @property
     @abstractmethod
@@ -52,12 +55,14 @@ class MambaSSUBackend(ABC):
 class TritonSSUBackend(MambaSSUBackend):
     """Triton-based SSU backend (vLLM's default)."""
 
-    def __init__(self):
+    def __init__(self, mamba_config: MambaConfig):
         from vllm.model_executor.layers.mamba.ops.mamba_ssm import (
             selective_state_update as _triton_selective_state_update,
         )
 
         self._kernel = _triton_selective_state_update
+        self._enable_stochastic_rounding = mamba_config.enable_stochastic_rounding
+        self._philox_rounds = mamba_config.philox_rounds
 
     @property
     def name(self) -> str:
@@ -101,13 +106,15 @@ class TritonSSUBackend(MambaSSUBackend):
             num_accepted_tokens=num_accepted_tokens,
             cu_seqlens=cu_seqlens,
             is_blackwell=is_blackwell,
+            enable_stochastic_rounding=self._enable_stochastic_rounding,
+            cache_philox_rounds=self._philox_rounds,
         )
 
 
 class FlashInferSSUBackend(MambaSSUBackend):
     """FlashInfer-based SSU backend."""
 
-    def __init__(self):
+    def __init__(self, mamba_config: MambaConfig):
         try:
             from flashinfer.mamba import selective_state_update as _fi_ssu
         except ImportError as e:
@@ -117,6 +124,12 @@ class FlashInferSSUBackend(MambaSSUBackend):
                 "pip install flashinfer"
             ) from e
         self._kernel = _fi_ssu
+        self._enable_stochastic_rounding = mamba_config.enable_stochastic_rounding
+        self._philox_rounds = (
+            mamba_config.philox_rounds
+            if mamba_config.philox_rounds > 0
+            else 10  # FlashInfer default
+        )
 
     @property
     def name(self) -> str:
@@ -181,7 +194,13 @@ class FlashInferSSUBackend(MambaSSUBackend):
                 f"{state_batch_indices.shape}"
             )
 
-        # is_blackwell is Triton-only (block size tuning), ignored here
+        if self._enable_stochastic_rounding:
+            rand_seed = torch.randint(
+                0, 2**63, (1,), dtype=torch.int64, device=state.device
+            )
+        else:
+            rand_seed = None
+
         self._kernel(
             state,
             x,
@@ -198,6 +217,8 @@ class FlashInferSSUBackend(MambaSSUBackend):
             else None,
             pad_slot_id=pad_slot_id,
             out=out,
+            rand_seed=rand_seed,
+            philox_rounds=self._philox_rounds,
         )
 
 
@@ -209,14 +230,16 @@ _BACKEND_REGISTRY: dict[MambaBackendEnum, type[MambaSSUBackend]] = {
 _mamba_ssu_backend: MambaSSUBackend | None = None
 
 
-def initialize_mamba_ssu_backend(backend: MambaBackendEnum | None = None) -> None:
+def initialize_mamba_ssu_backend(mamba_config: MambaConfig) -> None:
     """Initialize the global Mamba SSU backend.
 
     Args:
-        backend: Which backend to use. Defaults to TRITON if None.
+        mamba_config: Mamba configuration including backend selection
+            and stochastic rounding settings.
     """
     global _mamba_ssu_backend
 
+    backend = mamba_config.backend
     if backend is None:
         backend = MambaBackendEnum.TRITON
 
@@ -226,7 +249,7 @@ def initialize_mamba_ssu_backend(backend: MambaBackendEnum | None = None) -> Non
             f"Valid options: {list(_BACKEND_REGISTRY.keys())}"
         )
 
-    _mamba_ssu_backend = _BACKEND_REGISTRY[backend]()
+    _mamba_ssu_backend = _BACKEND_REGISTRY[backend](mamba_config)
     logger.info("Using %s Mamba SSU backend.", _mamba_ssu_backend.name)
 
 

@@ -111,15 +111,6 @@ class CacheConfig:
     - "align": only cache the mamba state of the last token of each scheduler step and
            when the token is at position i * block_size.
     """
-    enable_mamba_cache_stochastic_rounding: bool = False
-    """Enable stochastic rounding when writing SSM state to fp16 cache.
-    Uses random bits to unbias the rounding error, which can improve
-    numerical stability for long sequences."""
-    mamba_cache_philox_rounds: int = 0
-    """Number of Philox PRNG rounds for stochastic rounding random number
-    generation. 0 uses the Triton default. Higher values improve randomness
-    quality at the cost of compute."""
-
     # Will be set after profiling.
     num_gpu_blocks: int | None = field(default=None, init=False)
     """The number of blocks to allocate for GPU memory."""
