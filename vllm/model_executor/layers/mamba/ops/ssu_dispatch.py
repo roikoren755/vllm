@@ -196,7 +196,7 @@ class FlashInferSSUBackend(MambaSSUBackend):
 
         if self._enable_stochastic_rounding:
             rand_seed = torch.randint(
-                0, 2**63, (1,), dtype=torch.int64, device=state.device
+                0, 2**63 - 1, (1,), dtype=torch.int64, device=state.device
             )
         else:
             rand_seed = None
