@@ -24,6 +24,7 @@ from collections.abc import Iterable
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import (
@@ -32,6 +33,7 @@ from vllm.distributed import (
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.fused_moe import GateLinear
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -45,6 +47,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.sequence import IntermediateTensors
+from vllm.triton_utils import tl, triton
 
 from .gemma4 import Gemma4MLP, _get_text_config
 from .utils import (
@@ -57,6 +60,160 @@ from .utils import (
 
 logger = init_logger(__name__)
 
+# csrc/moe/moe_align_sum_kernels.cu asserts padded_num_experts < 1024.
+_MOE_ALIGN_MAX_EXPERTS = 1024
+
+
+@triton.jit
+def _decode_top_token_kernel(
+    logits_ptr,
+    topk_ids_ptr,
+    token_ordering_ptr,
+    out_ptr,
+    num_selected,
+    TOP_K: tl.constexpr,
+    VOCAB_PER_CENTROID: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    token = tl.program_id(0)
+    offs = tl.arange(0, BLOCK)
+    vals = tl.load(
+        logits_ptr + token * num_selected + offs,
+        mask=offs < num_selected,
+        other=-float("inf"),
+    )
+    best = tl.argmax(vals, axis=0)
+    centroid = tl.load(topk_ids_ptr + token * TOP_K + best // VOCAB_PER_CENTROID)
+    vocab_id = tl.load(
+        token_ordering_ptr
+        + centroid.to(tl.int64) * VOCAB_PER_CENTROID
+        + best % VOCAB_PER_CENTROID
+    )
+    tl.store(out_ptr + token, vocab_id)
+
+
+def _decode_top_token(
+    logits: torch.Tensor,
+    topk_ids: torch.Tensor,
+    token_ordering: torch.Tensor,
+    top_k: int,
+    vocab_size_per_centroid: int,
+) -> torch.Tensor:
+    """Fused argmax over sparse logits + decode to vocab ids.
+
+    The argmax gives a position in the selected candidate set, not a vocab
+    id: position p means centroid slot p // vocab_size_per_centroid and
+    offset p % vocab_size_per_centroid within it. Doing that eagerly costs
+    five launches (argmax, floordiv, mod, gather, index) of almost no work
+    each, ~13us at T=1 against a ~4us GEMM. Fusing them costs ~2us.
+    """
+    num_tokens = logits.shape[0]
+    out = torch.empty(num_tokens, dtype=token_ordering.dtype, device=logits.device)
+    _decode_top_token_kernel[(num_tokens,)](
+        logits,
+        topk_ids,
+        token_ordering,
+        out,
+        top_k * vocab_size_per_centroid,
+        top_k,
+        vocab_size_per_centroid,
+        BLOCK=triton.next_power_of_2(top_k * vocab_size_per_centroid),
+    )
+    return out
+
+
+def _grouped_gemm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    topk_ids: torch.Tensor,
+    top_k: int,
+    num_experts: int,
+    config_override: dict | None = None,
+) -> torch.Tensor:
+    """Single grouped GEMM: (T, K) x (E, N, K)[topk_ids] -> (T, top_k, N).
+
+    Borrows the first half of ``fused_experts``: no activation, no second
+    GEMM, no routing-weight reduction. The kernel writes rows at the
+    original flat (token, k) offset, so no unpermute is needed.
+
+    The only place in this file that touches a private fused_moe API.
+    """
+    import triton.language as tl
+
+    from vllm.model_executor.layers.fused_moe.fused_moe import (
+        _prepare_expert_assignment,
+        dispatch_fused_moe_kernel,
+    )
+
+    compute_type = {
+        torch.bfloat16: tl.bfloat16,
+        torch.float16: tl.float16,
+        torch.float32: tl.float32,
+    }[x.dtype]
+
+    # Tuned by sweeping BLOCK_SIZE_N x num_warps x num_stages. Block shape
+    # swings the GEMM itself by ~4x but the whole sparse-head path by only
+    # ~4%, since the GEMM is a small share of it; anything in the
+    # BLOCK_SIZE_N 16-64 range with >=2 warps is within noise of this.
+    config = config_override or {
+        "BLOCK_SIZE_M": 16,
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": 128,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 4,
+        "num_stages": 3,
+    }
+    if num_experts >= _MOE_ALIGN_MAX_EXPERTS:
+        # moe_align_block_size's CUDA kernel asserts padded_num_experts <
+        # 1024, so the token-sorted path is unreachable here. Fall back to
+        # naive block assignment (one block per (token, k) pair), which is
+        # what _prepare_expert_assignment picks for small batches anyway.
+        # Note this forfeits cross-token weight dedup.
+        sorted_ids = None
+        expert_ids = topk_ids.view(-1)
+        num_tokens_post_padded = torch.full(
+            (1,),
+            topk_ids.numel() * config["BLOCK_SIZE_M"],
+            dtype=torch.int32,
+            device=topk_ids.device,
+        )
+    else:
+        sorted_ids, expert_ids, num_tokens_post_padded = _prepare_expert_assignment(
+            topk_ids,
+            config,
+            x.shape[0],
+            top_k,
+            num_experts,
+            None,
+        )
+    out = torch.empty(
+        (x.shape[0], top_k, weight.shape[1]),
+        dtype=x.dtype,
+        device=x.device,
+    )
+    dispatch_fused_moe_kernel(
+        x,
+        weight,
+        out,
+        None,  # A_scale
+        None,  # B_scale
+        None,  # B_zp
+        None,  # topk_weights (mul_routed_weight=False)
+        sorted_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        False,  # mul_routed_weight
+        top_k,
+        config,
+        compute_type,
+        False,  # use_fp8_w8a8
+        False,  # use_int8_w8a8
+        False,  # use_int8_w8a16
+        False,  # use_int4_w4a16
+        False,  # per_channel_quant
+    )
+    return out
+
 
 class Gemma4MTPMaskedEmbedder(nn.Module):
     """Sparse logit computation via centroid-based vocabulary masking.
@@ -65,6 +222,13 @@ class Gemma4MTPMaskedEmbedder(nn.Module):
     hidden states to centroid scores, selects top-K centroids, and
     computes logits only for the ~top_k * (vocab_size / num_centroids)
     tokens belonging to those centroids.
+
+    Two backends, selected by ``VLLM_GEMMA4_MTP_SPARSE_HEAD_BACKEND``:
+
+    - ``gather``: scattered row gather + einsum.
+    - ``moe``: the same computation expressed as a top-k routed grouped
+      GEMM (centroids are experts, the LM head rows for a centroid are
+      that expert's weight). Requires ``build_centroid_weight()``.
     """
 
     token_ordering: torch.Tensor
@@ -75,6 +239,7 @@ class Gemma4MTPMaskedEmbedder(nn.Module):
         vocab_size: int,
         num_centroids: int,
         centroid_intermediate_top_k: int,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -84,11 +249,55 @@ class Gemma4MTPMaskedEmbedder(nn.Module):
         self.vocab_size_per_centroid = vocab_size // num_centroids
         self.num_selected = centroid_intermediate_top_k * self.vocab_size_per_centroid
 
-        self.centroids = nn.Linear(hidden_size, num_centroids, bias=False)
+        # out_dtype=None keeps the ReplicatedLinear fallback, matching the
+        # previous nn.Linear numerics exactly. Every specialized GateLinear
+        # tier requires fp32 output; call set_out_dtype(torch.float32) to
+        # opt into them (changes centroid selection, so measure).
+        self.centroids = GateLinear(
+            hidden_size,
+            num_centroids,
+            bias=False,
+            prefix=f"{prefix}.centroids",
+        )
         self.register_buffer(
             "token_ordering",
             torch.empty(vocab_size, dtype=torch.long),
         )
+
+        self.use_moe_backend = envs.VLLM_GEMMA4_MTP_SPARSE_HEAD_BACKEND == "moe"
+        # (num_centroids, vocab_size_per_centroid, hidden_size), built by
+        # build_centroid_weight() once the LM head weights are loaded.
+        self.centroid_weight: torch.Tensor | None = None
+
+    def build_centroid_weight(self, lm_head_weight: torch.Tensor) -> None:
+        """Permute the LM head into centroid-major (E, N, K) layout.
+
+        Turns the per-token scatter of ``num_selected`` rows into
+        ``top_k`` contiguous tiles, and is the weight layout the grouped
+        GEMM expects. Idempotent; no-op unless the moe backend is active.
+        """
+        if not self.use_moe_backend or self.centroid_weight is not None:
+            return
+        self.centroid_weight = (
+            lm_head_weight[self.token_ordering]
+            .view(self.num_centroids, self.vocab_size_per_centroid, -1)
+            .contiguous()
+        )
+
+    def _route(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Top-k centroid selection. Returns (num_tokens, top_k) ids."""
+        centroid_scores, _ = self.centroids(hidden_states)
+        # sorted=False measures 27% faster (12.7us vs 17.3us at T=1) and
+        # selects the same centroid set; only the ordering differs, which
+        # affects argmax tie-breaking among equal logits. Compare backends
+        # by token-set agreement rather than exact token equality.
+        _, top_k_indices = torch.topk(
+            centroid_scores,
+            k=self.centroid_intermediate_top_k,
+            dim=-1,
+            sorted=False,
+        )
+        return top_k_indices
 
     def _select_and_score(
         self,
@@ -102,11 +311,7 @@ class Gemma4MTPMaskedEmbedder(nn.Module):
             indices: (num_tokens, num_selected) corresponding vocab indices.
         """
         num_tokens = hidden_states.shape[0]
-        _, top_k_indices = torch.topk(
-            self.centroids(hidden_states),
-            k=self.centroid_intermediate_top_k,
-            dim=-1,
-        )
+        top_k_indices = self._route(hidden_states)
         clusters = self.token_ordering.view(
             self.num_centroids,
             self.vocab_size_per_centroid,
@@ -120,15 +325,52 @@ class Gemma4MTPMaskedEmbedder(nn.Module):
         logits = torch.einsum("td,tsd->ts", hidden_states, embeddings)
         return logits, selected.view(num_tokens, -1)
 
+    def _select_and_score_moe(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Grouped-GEMM equivalent of ``_select_and_score``.
+
+        Returns:
+            logits: (num_tokens, top_k, vocab_size_per_centroid).
+            top_k_indices: (num_tokens, top_k) selected centroid ids.
+
+        Logits are left unflattened so callers that only need an argmax
+        can decode vocab ids arithmetically instead of materializing the
+        (num_tokens, num_selected) index tensor.
+        """
+        assert self.centroid_weight is not None, (
+            "build_centroid_weight() must be called before the moe backend is used."
+        )
+        top_k_indices = self._route(hidden_states).to(torch.int32)
+        logits = _grouped_gemm(
+            hidden_states,
+            self.centroid_weight,
+            top_k_indices,
+            self.centroid_intermediate_top_k,
+            self.num_centroids,
+        )
+        return logits, top_k_indices
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         lm_head_weight: torch.Tensor,
     ) -> torch.Tensor:
         """Full-vocab logits with non-selected positions masked to -inf."""
-        logits, indices = self._select_and_score(hidden_states, lm_head_weight)
+        num_tokens = hidden_states.shape[0]
+        if self.use_moe_backend:
+            logits, top_k_indices = self._select_and_score_moe(hidden_states)
+            logits = logits.view(num_tokens, -1)
+            clusters = self.token_ordering.view(
+                self.num_centroids,
+                self.vocab_size_per_centroid,
+            )
+            indices = clusters[top_k_indices.long()].view(num_tokens, -1)
+        else:
+            logits, indices = self._select_and_score(hidden_states, lm_head_weight)
         output = torch.full(
-            (hidden_states.shape[0], self.vocab_size),
+            (num_tokens, self.vocab_size),
             fill_value=torch.finfo(hidden_states.dtype).min,
             dtype=hidden_states.dtype,
             device=hidden_states.device,
@@ -141,6 +383,15 @@ class Gemma4MTPMaskedEmbedder(nn.Module):
         lm_head_weight: torch.Tensor,
     ) -> torch.Tensor:
         """Sparse argmax — returns vocab token IDs without full-vocab tensor."""
+        if self.use_moe_backend:
+            logits, top_k_indices = self._select_and_score_moe(hidden_states)
+            return _decode_top_token(
+                logits.view(hidden_states.shape[0], -1),
+                top_k_indices,
+                self.token_ordering,
+                self.centroid_intermediate_top_k,
+                self.vocab_size_per_centroid,
+            )
         logits, indices = self._select_and_score(hidden_states, lm_head_weight)
         return indices.gather(-1, logits.argmax(-1, keepdim=True)).squeeze(-1)
 
@@ -482,6 +733,7 @@ class Gemma4MTP(nn.Module):
         text_config = _get_text_config(config)
         self.quant_config = get_draft_quant_config(vllm_config)
         self.config = config
+        self.vocab_size = text_config.vocab_size
         self._stable_full_lm_head_weight: torch.Tensor | None = None
 
         self.model = Gemma4MultiTokenPredictor(
@@ -515,14 +767,17 @@ class Gemma4MTP(nn.Module):
                 vocab_size=text_config.vocab_size,
                 num_centroids=num_centroids,
                 centroid_intermediate_top_k=top_k,
+                prefix=maybe_prefix(prefix, "masked_embedding"),
             )
             logger.info(
                 "Gemma4 MTP: centroids masking enabled "
-                "(num_centroids=%d, top_k=%d, active_tokens=%d/%d).",
+                "(num_centroids=%d, top_k=%d, active_tokens=%d/%d, "
+                "backend=%s).",
                 num_centroids,
                 top_k,
                 top_k * (text_config.vocab_size // num_centroids),
                 text_config.vocab_size,
+                envs.VLLM_GEMMA4_MTP_SPARSE_HEAD_BACKEND,
             )
         else:
             self.masked_embedding = None
@@ -530,6 +785,10 @@ class Gemma4MTP(nn.Module):
         draft_cfg = vllm_config.speculative_config.draft_model_config
         gen_cfg = draft_cfg.try_get_generation_config()
         self._suppress_token_ids = gen_cfg.get("suppress_tokens") if gen_cfg else None
+        # Materialized on first use: indexing with the Python list rebuilds
+        # an index tensor and copies H2D on every call, and blocks graph
+        # capture.
+        self._suppress_mask: torch.Tensor | None = None
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -563,11 +822,33 @@ class Gemma4MTP(nn.Module):
                 lm_head_weight,
                 dim=0,
             )
-        lm_head_weight = lm_head_weight[: self.masked_embedding.vocab_size]
-        if tp_size > 1:
-            lm_head_weight = lm_head_weight.contiguous()
-            self._stable_full_lm_head_weight = lm_head_weight
+            lm_head_weight = lm_head_weight[
+                : self.masked_embedding.vocab_size
+            ].contiguous()
+        else:
+            lm_head_weight = lm_head_weight[: self.masked_embedding.vocab_size]
+        self._stable_full_lm_head_weight = lm_head_weight
         return lm_head_weight
+
+    def _ensure_centroid_weight(self) -> None:
+        """Build the centroid-major weight if it is not ready yet.
+
+        Normally built at the end of load_weights, so the allocation is
+        counted by memory profiling. This is the fallback for any path
+        that reaches compute_logits/get_top_tokens first.
+        """
+        masked = self.masked_embedding
+        if masked is not None:
+            masked.build_centroid_weight(self._get_full_lm_head_weight())
+
+    def _get_suppress_mask(self, device: torch.device) -> torch.Tensor | None:
+        if not self._suppress_token_ids:
+            return None
+        if self._suppress_mask is None:
+            mask = torch.zeros(self.vocab_size, dtype=torch.bool)
+            mask[list(self._suppress_token_ids)] = True
+            self._suppress_mask = mask.to(device)
+        return self._suppress_mask
 
     def compute_logits(
         self,
@@ -575,14 +856,17 @@ class Gemma4MTP(nn.Module):
         spec_step_idx: int = 0,
     ) -> torch.Tensor | None:
         if self.masked_embedding is not None:
+            self._ensure_centroid_weight()
             logits = self.masked_embedding(
                 hidden_states,
                 self._get_full_lm_head_weight(),
             )
         else:
             logits = self.logits_processor(self.lm_head, hidden_states)
-        if logits is not None and self._suppress_token_ids:
-            logits[:, self._suppress_token_ids] = -float("inf")
+        if logits is not None:
+            suppress_mask = self._get_suppress_mask(logits.device)
+            if suppress_mask is not None:
+                logits.masked_fill_(suppress_mask, -float("inf"))
         return logits
 
     def get_top_tokens(
@@ -590,6 +874,7 @@ class Gemma4MTP(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         """Sparse argmax via centroids masking. Returns token IDs directly."""
+        self._ensure_centroid_weight()
         return self.masked_embedding.get_top_tokens(
             hidden_states,
             self._get_full_lm_head_weight(),
@@ -598,4 +883,8 @@ class Gemma4MTP(nn.Module):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         self._stable_full_lm_head_weight = None
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        # Build here so the permuted copy is allocated before memory
+        # profiling and before any dummy run touches the sparse head.
+        self._ensure_centroid_weight()
+        return loaded

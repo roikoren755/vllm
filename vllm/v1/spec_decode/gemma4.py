@@ -190,6 +190,8 @@ class Gemma4Proposer(SpecDecodeBaseProposer):
         self._setup_gemma4_kv_sharing(target_attn_layer_names)
 
         if getattr(self.model, "masked_embedding", None) is not None:
+            # Normally already built by load_weights; idempotent no-op then.
+            self.model._ensure_centroid_weight()
             self._setup_centroids_cuda_graphs()
 
     def validate_same_kv_cache_group(self, kv_cache_config: KVCacheConfig) -> None:
