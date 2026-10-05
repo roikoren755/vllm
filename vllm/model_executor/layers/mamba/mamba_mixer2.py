@@ -488,7 +488,13 @@ class MambaMixer2(MambaBase, PluggableLayer):
         a_weight_loader = composed_weight_loader(
             sharded_weight_loader(0), lambda x: -torch.exp(x.float())
         )
-        set_weight_attrs(self.A, {"weight_loader": a_weight_loader})
+        set_weight_attrs(
+            self.A,
+            {
+                "weight_loader": a_weight_loader,
+                "additional_allowed_weight_dtypes": (torch.float16, torch.bfloat16),
+            },
+        )
         set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
 
         self.out_proj = RowParallelLinear(

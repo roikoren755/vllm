@@ -224,6 +224,12 @@ class AutoWeightsLoader:
     Similarly, the weight loading logic for individual parameters can be
     overridden by defining a `weight_loader` method.
 
+    To suppress dtype mismatch warnings for expected conversions, set a
+    parameter's `additional_allowed_weight_dtypes` attribute to a collection of
+    checkpoint dtypes, e.g. `(torch.float16, torch.bfloat16)`. These are accepted
+    in addition to the parameter's own dtype. This only controls warnings, not
+    dtype conversion.
+
     Detailed weight loading information can be viewed by setting the
     environment variable `VLLM_LOGGING_LEVEL=DEBUG`.
     """
@@ -321,7 +327,9 @@ class AutoWeightsLoader:
                     f"into a single parameter {base_prefix!r}"
                 )
 
-            if param.dtype != weight_data.dtype:
+            if param.dtype != weight_data.dtype and weight_data.dtype not in getattr(
+                param, "additional_allowed_weight_dtypes", ()
+            ):
                 logger.warning(
                     "Attempted to load weight %s with dtype %s into "
                     "parameter with dtype %s",

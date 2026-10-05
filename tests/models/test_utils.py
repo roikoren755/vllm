@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from unittest.mock import Mock
+
 import pytest
 import regex as re
 import torch
@@ -17,6 +19,45 @@ from vllm.model_executor.models.utils import (
 from vllm.platforms import current_platform
 
 DEVICE_TYPE = current_platform.device_type
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "weight_dtype,additional_allowed_weight_dtypes,should_warn",
+    [
+        (torch.bfloat16, None, False),
+        (torch.float32, None, True),
+        (torch.float32, (), True),
+        (torch.float32, (torch.float16, torch.float32), False),
+        (torch.float16, (torch.float16, torch.float32), False),
+        (torch.float64, (torch.float16, torch.float32), True),
+        (torch.bfloat16, (torch.float16, torch.float32), False),
+    ],
+)
+def test_auto_weights_loader_warns_only_for_unaccepted_dtypes(
+    monkeypatch, weight_dtype, additional_allowed_weight_dtypes, should_warn
+):
+    """Accepted checkpoint dtypes suppress warnings without changing loading."""
+    mod = torch.nn.Linear(2, 2, bias=False, dtype=torch.bfloat16)
+    if additional_allowed_weight_dtypes is not None:
+        mod.weight.additional_allowed_weight_dtypes = additional_allowed_weight_dtypes
+    warning = Mock()
+    monkeypatch.setattr("vllm.model_executor.models.utils.logger.warning", warning)
+    weight = torch.full((2, 2), 0.1, dtype=weight_dtype)
+
+    loaded = AutoWeightsLoader(mod).load_weights([("weight", weight)])
+
+    assert loaded == {"weight"}
+    torch.testing.assert_close(mod.weight, weight.to(dtype=torch.bfloat16))
+    if should_warn:
+        warning.assert_called_once_with(
+            "Attempted to load weight %s with dtype %s into parameter with dtype %s",
+            "weight",
+            weight_dtype,
+            torch.bfloat16,
+        )
+    else:
+        warning.assert_not_called()
 
 
 class ModuleWithBatchNorm(torch.nn.Module):
