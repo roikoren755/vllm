@@ -185,7 +185,7 @@ class MambaPrefillCheckpointExporter:
         )
         width = raw_qkv.shape[-1]
         recurrent_row_size = recurrent_checkpoint[0].numel()
-        block_size = 256
+        block_size = 512
         store_cache_checkpoints_kernel[
             (
                 checkpoint.checkpoint_offsets.numel(),
