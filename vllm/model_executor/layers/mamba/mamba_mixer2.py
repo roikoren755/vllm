@@ -966,7 +966,10 @@ class MambaMixer2(MambaBase, PluggableLayer):
             )
             if self.use_replayssm:
                 assert self.replayssm_buffer_len is not None
-                if self.mamba_config.backend == MambaBackendEnum.FLASHINFER:
+                if (
+                    self.mamba_config.effective_decode_backend
+                    == MambaBackendEnum.FLASHINFER
+                ):
                     assert ring_start is not None
                     assert prev_num_accepted is not None
                     assert attn_metadata.replayssm_scratch is not None
@@ -1131,7 +1134,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 n_groups=self.n_groups,
                 tp_world_size=tp_world_size,
                 logical_window=self.replayssm_buffer_len,
-                backend=self.mamba_config.backend,
+                backend=self.mamba_config.effective_decode_backend,
                 num_speculative_tokens=self.num_spec,
             )
         return base_shape
