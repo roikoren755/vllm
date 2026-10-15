@@ -108,7 +108,8 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
         self.replayssm_buffer_len = vllm_config.cache_config.replayssm_buffer_len
         self.use_flashinfer_replayssm = (
             self.use_replayssm
-            and vllm_config.mamba_config.backend == MambaBackendEnum.FLASHINFER
+            and vllm_config.mamba_config.effective_decode_backend
+            == MambaBackendEnum.FLASHINFER
         )
 
         scheduler_config = vllm_config.scheduler_config

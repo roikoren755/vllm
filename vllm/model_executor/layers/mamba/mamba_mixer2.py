@@ -749,7 +749,10 @@ class MambaMixer2(MambaBase, PluggableLayer):
             ssm_state = self.kv_cache[1]
             if self.use_replayssm:
                 x_cache, dt_cache, B_cache = self.kv_cache[2:5]
-                if self.mamba_config.backend == MambaBackendEnum.FLASHINFER:
+                if (
+                    self.mamba_config.effective_decode_backend
+                    == MambaBackendEnum.FLASHINFER
+                ):
                     ring_start = self._replayssm_ring_start
                     prev_num_accepted = self._replayssm_prev_num_accepted
                     prev_query_len = self._replayssm_prev_query_len
@@ -907,7 +910,8 @@ class MambaMixer2(MambaBase, PluggableLayer):
             assert state_indices_tensor_d is not None
             if (
                 self.use_replayssm
-                and self.mamba_config.backend == MambaBackendEnum.FLASHINFER
+                and self.mamba_config.effective_decode_backend
+                == MambaBackendEnum.FLASHINFER
                 and use_spec_decode
                 and self._commits_replayssm_trackers
             ):
@@ -982,7 +986,10 @@ class MambaMixer2(MambaBase, PluggableLayer):
             )
             if self.use_replayssm:
                 assert self.replayssm_buffer_len is not None
-                if self.mamba_config.backend == MambaBackendEnum.FLASHINFER:
+                if (
+                    self.mamba_config.effective_decode_backend
+                    == MambaBackendEnum.FLASHINFER
+                ):
                     assert ring_start is not None
                     assert prev_num_accepted is not None
                     assert prev_query_len is not None
@@ -1138,7 +1145,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 n_groups=self.n_groups,
                 tp_world_size=tp_world_size,
                 logical_window=self.replayssm_buffer_len,
-                backend=self.mamba_config.backend,
+                backend=self.mamba_config.effective_decode_backend,
                 num_speculative_tokens=self.num_spec,
             )
         return base_shape
@@ -1168,7 +1175,8 @@ def share_replayssm_ring_trackers(
         if (
             isinstance(layer, MambaMixer2)
             and layer.use_replayssm
-            and layer.mamba_config.backend == MambaBackendEnum.FLASHINFER
+            and layer.mamba_config.effective_decode_backend
+            == MambaBackendEnum.FLASHINFER
         ):
             replayssm_mixers[layer_name] = layer
 

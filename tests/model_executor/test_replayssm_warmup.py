@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 import torch
 
-from vllm.config.mamba import MambaBackendEnum
+from vllm.config.mamba import MambaBackendEnum, MambaConfig
 from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
 from vllm.model_executor.warmup import replayssm_warmup as warmup
 from vllm.platforms import current_platform
@@ -36,11 +36,12 @@ def _autotune_runner(
     max_num_tokens: int = 100,
     use_replayssm: bool = True,
     backend: MambaBackendEnum = MambaBackendEnum.FLASHINFER,
+    decode_backend: MambaBackendEnum | None = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         vllm_config=SimpleNamespace(
             cache_config=SimpleNamespace(use_replayssm=use_replayssm),
-            mamba_config=SimpleNamespace(backend=backend),
+            mamba_config=MambaConfig(backend=backend, decode_backend=decode_backend),
             use_v2_model_runner=use_v2_model_runner,
         ),
         uniform_decode_query_len=query_len,
@@ -95,12 +96,14 @@ def test_replayssm_autotune_decode_kwargs(runner_kwargs, expected_num_reqs):
     [
         (dict(use_replayssm=False), True),
         (dict(backend=MambaBackendEnum.TRITON), True),
+        (dict(decode_backend=MambaBackendEnum.TRITON), True),
         ({}, False),
         (dict(num_blocks=1), True),
     ],
     ids=[
         "replayssm_disabled",
         "non_flashinfer_backend",
+        "non_flashinfer_decode_override",
         "kernel_unavailable",
         "zero_non_padding_slots",
     ],

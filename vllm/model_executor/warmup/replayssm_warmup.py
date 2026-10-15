@@ -26,7 +26,7 @@ def _replayssm_autotune_kwargs(
     config = runner.vllm_config
     if not (
         config.cache_config.use_replayssm
-        and config.mamba_config.backend == MambaBackendEnum.FLASHINFER
+        and config.mamba_config.effective_decode_backend == MambaBackendEnum.FLASHINFER
     ):
         return None
     if not flashinfer_replayssm_autotune_supported():

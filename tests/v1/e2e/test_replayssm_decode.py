@@ -49,13 +49,13 @@ def _check_replayssm_parity(
     *,
     tensor_parallel_size=1,
     mamba_backend: str = "triton",
+    replay_decode_backend: str | None = None,
     prompts: list[str] = PROMPTS,
     name_1: str = "replayssm",
     expected_v2: bool | None = None,
 ):
     # Compare logprobs, not greedy ids: ReplaySSM's fp arithmetic can flip a
-    # near-tie. Baseline and ReplaySSM use the same backend so only ReplaySSM
-    # behavior varies.
+    # near-tie. The baseline uses ordinary SSU; ReplaySSM may override its provider.
     common = dict(
         max_model_len=1024,
         trust_remote_code=True,
@@ -67,6 +67,8 @@ def _check_replayssm_parity(
         if expected_v2 is not None:
             assert llm.llm.llm_engine.vllm_config.use_v2_model_runner is expected_v2
         baseline = llm.generate_greedy_logprobs(prompts, max_tokens=32, num_logprobs=5)
+    if replay_decode_backend is not None:
+        common["mamba_decode_backend"] = replay_decode_backend
     with vllm_runner(
         model_name,
         use_replayssm=True,
@@ -117,6 +119,27 @@ def test_replayssm_flashinfer_decode_matches_baseline(
             )
     finally:
         # The context restores the environment before the final cache reset.
+        envs.disable_envs_cache()
+
+
+@pytest.mark.parametrize("model_name", FLASHINFER_MODELS)
+def test_replayssm_decode_backend_override_matches_triton_baseline(
+    vllm_runner, model_name, monkeypatch
+):
+    """An overridden Replay deployment matches a separate Triton SSU baseline."""
+    try:
+        with monkeypatch.context() as patch:
+            patch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+            envs.disable_envs_cache()
+            _check_replayssm_parity(
+                vllm_runner,
+                model_name,
+                replay_decode_backend="flashinfer",
+                prompts=FLASHINFER_PROMPTS,
+                name_1="replayssm_decode_backend_override",
+                expected_v2=True,
+            )
+    finally:
         envs.disable_envs_cache()
 
 
