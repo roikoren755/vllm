@@ -255,7 +255,7 @@ def store_cache_checkpoints_kernel(
     width_idx = cols // STATE_LEN
     history_idx = cols % STATE_LEN
     checkpoint_end = tl.load(query_start_loc_ptr + seq_idx) + checkpoint_offset
-    token_idx = checkpoint_end - STATE_LEN + history_idx
+    token_idx = (checkpoint_end - STATE_LEN + history_idx).to(tl.int64)
     values = tl.load(
         x_ptr + token_idx * x_stride_0 + width_idx * x_stride_1,
         mask=valid_conv,
