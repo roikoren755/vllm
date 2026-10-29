@@ -832,6 +832,7 @@ class EngineArgs:
 
     mamba_backend: MambaBackendEnum = MambaBackendEnum.TRITON
     mamba_decode_backend: MambaBackendEnum | None = None
+    mamba_prefill_backend: MambaBackendEnum | None = None
     mamba_ssu_algorithm: MambaSSUAlgorithm | None = None
     enable_mamba_cache_stochastic_rounding: bool = (
         MambaConfig.enable_stochastic_rounding
@@ -1134,6 +1135,9 @@ class EngineArgs:
         mamba_group.add_argument("--mamba-backend", **mamba_kwargs["backend"])
         mamba_group.add_argument(
             "--mamba-decode-backend", **mamba_kwargs["decode_backend"]
+        )
+        mamba_group.add_argument(
+            "--mamba-prefill-backend", **mamba_kwargs["prefill_backend"]
         )
         mamba_group.add_argument(
             "--mamba-ssu-algorithm", **mamba_kwargs["ssu_algorithm"]
@@ -2806,6 +2810,8 @@ class EngineArgs:
         mamba_config_dict["backend"] = self.mamba_backend
         if self.mamba_decode_backend is not None:
             mamba_config_dict["decode_backend"] = self.mamba_decode_backend
+        if self.mamba_prefill_backend is not None:
+            mamba_config_dict["prefill_backend"] = self.mamba_prefill_backend
         if self.mamba_ssu_algorithm is not None:
             mamba_config_dict["ssu_algorithm"] = self.mamba_ssu_algorithm
         if self.enable_mamba_cache_stochastic_rounding:

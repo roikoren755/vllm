@@ -43,6 +43,10 @@ class MambaConfig:
     decode_backend: MambaBackendEnum | None = None
     """Decode backend for SSU or ReplaySSM. None inherits `backend`."""
 
+    prefill_backend: MambaBackendEnum | None = None
+    """Mamba2 SSD prefill backend. None inherits `backend`, falling back to
+    Triton if an inherited FlashInfer SSD is unavailable."""
+
     enable_stochastic_rounding: bool = False
     """Enable stochastic rounding when writing SSM state to fp16 cache.
     Uses random bits to unbias the rounding error, which can improve
@@ -58,7 +62,7 @@ class MambaConfig:
     be supported by FlashInfer for the active GPU, state dtype, and decoding
     mode."""
 
-    @field_validator("backend", "decode_backend", mode="before")
+    @field_validator("backend", "decode_backend", "prefill_backend", mode="before")
     @classmethod
     def validate_backend_before(cls, value: Any) -> Any:
         """Enable parsing of backend enum values from strings."""
@@ -69,6 +73,12 @@ class MambaConfig:
     @property
     def effective_decode_backend(self) -> MambaBackendEnum:
         return self.decode_backend if self.decode_backend is not None else self.backend
+
+    @property
+    def effective_prefill_backend(self) -> MambaBackendEnum:
+        return (
+            self.prefill_backend if self.prefill_backend is not None else self.backend
+        )
 
     def validate_ssu_algorithm(self) -> None:
         if self.ssu_algorithm is None:

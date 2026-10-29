@@ -61,6 +61,9 @@ from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateCopyFuncsByType
+from vllm.model_executor.layers.mamba.ops.ssd_dispatch import (
+    initialize_mamba_ssd_backend,
+)
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
 )
@@ -7101,6 +7104,9 @@ class GPUModelRunner(
             self.vllm_config.mamba_config,
             self.kv_cache_config,
             use_replayssm=self.vllm_config.cache_config.use_replayssm,
+        )
+        initialize_mamba_ssd_backend(
+            self.vllm_config.mamba_config, self.kv_cache_config
         )
         # The kernel block size for all KV cache groups. For example, if
         # kv_cache_manager uses block_size 256 for a given group, but the attention
