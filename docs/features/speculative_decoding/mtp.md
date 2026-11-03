@@ -67,6 +67,25 @@ vllm serve XiaomiMiMo/MiMo-7B-Base \
     --speculative-config '{"method":"mtp","num_speculative_tokens":1}'
 ```
 
+## Nemotron Shortcut index sharing
+
+Nemotron Shortcut (Nemotron 4) can reuse the first MTP step's SDSA index
+selections for later draft steps. The first draft step after each target
+verification selects fresh keys. Attention K/V caching continues on every step.
+Sharing requires SDSA and one physical MTP block, including checkpoints that
+reuse one block with `mtp_use_repeated_layer`.
+
+Sharing follows the checkpoint's `index_share_for_mtp_iteration` setting and is
+disabled when the setting is absent. Override it with the speculative config:
+
+```bash
+vllm serve /path/to/checkpoint --tensor-parallel-size 2 \
+    --speculative-config '{"method":"mtp","num_speculative_tokens":5,"index_share_for_mtp_iteration":true}'
+```
+
+Set `index_share_for_mtp_iteration` to `false` to compare without sharing.
+Shared selections remain fixed until the next target verification.
+
 ## Notes
 
 - MTP only works for model families that support MTP in vLLM.

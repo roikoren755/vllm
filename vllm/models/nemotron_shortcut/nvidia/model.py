@@ -192,26 +192,35 @@ class NemotronShortcutSparseAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.attn",
         )
+        self.attn.indexer_projections = (self.indexer["q_proj"], self.indexer["k_proj"])
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.forward_projected(*self.project(hidden_states))
 
-    def project(
-        self, hidden_states: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def project(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, ...]:
         """The input projections, which precede the indexer and attention ops."""
         qkv, _ = self.qkv_proj(hidden_states)
+        if self.attn.prefill_topk_indices is not None:
+            return qkv, hidden_states
         indexer_q, _ = self.indexer["q_proj"](hidden_states)
         indexer_k, _ = self.indexer["k_proj"](hidden_states)
         return qkv, indexer_q, indexer_k
 
     def forward_projected(
-        self, qkv: torch.Tensor, indexer_q: torch.Tensor, indexer_k: torch.Tensor
+        self,
+        qkv: torch.Tensor,
+        indexer_q: torch.Tensor,
+        indexer_k: torch.Tensor | None = None,
     ) -> torch.Tensor:
         q, k, v = qkv.split(
             [self.num_heads * self.head_dim, self.head_dim, self.head_dim], dim=-1
         )
-        output, _ = self.o_proj(self.attn(indexer_q, indexer_k, q, k, v))
+        if self.attn.prefill_topk_indices is not None:
+            attention_output = self.attn(None, None, q, k, v, hidden_states=indexer_q)
+        else:
+            assert indexer_k is not None
+            attention_output = self.attn(indexer_q, indexer_k, q, k, v)
+        output, _ = self.o_proj(attention_output)
         return output
 
 

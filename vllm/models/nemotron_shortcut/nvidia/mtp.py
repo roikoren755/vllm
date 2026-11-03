@@ -60,7 +60,7 @@ from .model import (
     ShortcutMoEAttentionLayer,
     load_nemotron_shortcut_weights,
 )
-from .sdsa import SdsaBuffers, allocate_sdsa_buffers
+from .sdsa import SdsaAttention, SdsaBuffers, allocate_sdsa_buffers
 
 
 class NemotronShortcutMTPLayer(nn.Module):
@@ -146,6 +146,11 @@ class NemotronShortcutMultiTokenPredictor(nn.Module):
         # One physical block reused for every predict step.
         self.repeated_layer = bool(getattr(config, "mtp_use_repeated_layer", False))
         num_blocks = 1 if self.repeated_layer else self.num_mtp_layers
+        share_indices = bool(getattr(config, "index_share_for_mtp_iteration", False))
+        if share_indices and num_blocks != 1:
+            raise ValueError(
+                "Nemotron Shortcut MTP index sharing requires one physical MTP block"
+            )
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
@@ -171,6 +176,24 @@ class NemotronShortcutMultiTokenPredictor(nn.Module):
                 for i in range(num_blocks)
             }
         )
+        self._sparse_attentions = [
+            module
+            for module in self.layers.modules()
+            if isinstance(module, SdsaAttention)
+        ]
+        if share_indices:
+            if not self._sparse_attentions:
+                raise ValueError("Nemotron Shortcut MTP index sharing requires SDSA")
+            for attention in self._sparse_attentions:
+                attention.enable_mtp_index_sharing()
+
+    def set_skip_topk(self, skip: bool) -> None:
+        for attention in self._sparse_attentions:
+            attention.skip_topk = skip
+
+    def compact_topk_indices(self, token_indices: torch.Tensor) -> None:
+        for attention in self._sparse_attentions:
+            attention.compact_topk_indices(token_indices)
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)

@@ -683,6 +683,25 @@ class GroupUnionMasksKernel(VllmJitKernel["GroupUnionMasksKernel.CompileKey"]):
 GROUP_UNION_MASKS_KERNEL = GroupUnionMasksKernel()
 
 
+@triton.jit
+def _store_logical_topk(
+    positions,
+    query_rows,
+    output,
+    POSITION_STRIDE: tl.constexpr,
+    OUTPUT_STRIDE: tl.constexpr,
+    TOP_K: tl.constexpr,
+):
+    """Retain each query's logical keys before converting selections to unions."""
+    row = tl.program_id(0).to(tl.int64)
+    query = tl.load(query_rows + row).to(tl.int64)
+    if query < 0:
+        return
+    column = tl.arange(0, TOP_K)
+    key = tl.load(positions + row * POSITION_STRIDE + column)
+    tl.store(output + query * OUTPUT_STRIDE + column, key)
+
+
 class SdsaPrefillPlan:
     """Tile layout for one scheduler step; `run` is called once per layer.
     `block_table` holds the planned requests' pages of PAGE tokens in order,
@@ -807,6 +826,7 @@ class SdsaPrefillPlan:
         valid_counts: torch.Tensor,
         mask: torch.Tensor,
         topk_workspace: torch.Tensor,
+        logical_topk: torch.Tensor | None = None,
     ) -> None:
         """Select each row's Top-K keys, given the query in tiled rows (row r
         is query query_rows[r]) and the keys, both in the config's indexer
@@ -824,7 +844,8 @@ class SdsaPrefillPlan:
         Initial and cached prefill are one pipeline: cached context is just
         more keys before the row's causal end. The step's threshold sample is
         gathered once; panels of whole 128-row query tiles of one selector
-        then run in turn, in one panel scratch."""
+        then run in turn, in one panel scratch. `logical_topk` retains each
+        query's logical key positions for MTP index sharing."""
         from flashinfer.sdsa import indexer_scores
         from flashinfer.token_sparse import group_union_masks
 
@@ -903,6 +924,15 @@ class SdsaPrefillPlan:
                     topk_workspace,
                     self.config,
                 )
+            if logical_topk is not None:
+                _store_logical_topk[(len(positions),)](
+                    positions,
+                    self.query_rows[rows],
+                    logical_topk,
+                    positions.stride(0),
+                    logical_topk.stride(0),
+                    positions.shape[1],
+                )
             if self.core != "union":  # each token's Top-K keys as its slots
                 _token_slots(
                     positions,
@@ -944,3 +974,8 @@ class SdsaPrefillPlan:
                 mine = mask[queries, :words].contiguous()
                 gathered = tp.all_gatherv(mine, sizes=self.rank_queries)
                 mask[: len(gathered), :words] = gathered
+            if logical_topk is not None:
+                gathered = tp.all_gatherv(
+                    logical_topk[queries].contiguous(), sizes=self.rank_queries
+                )
+                logical_topk[: len(gathered)] = gathered

@@ -110,3 +110,46 @@ def test_sdsa_engine(tmp_path, monkeypatch) -> None:
         name_1="full",
     )
     assert metrics["vllm:spec_decode_num_accepted_tokens"].value > 0
+
+
+def test_mtp_index_sharing_preserves_target_outputs(tmp_path, monkeypatch) -> None:
+    """Compiled MTP reuses selections across chunked prefill and verification."""
+    monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+    text = make_config(
+        layer_types=["linear_attention"] * 3 + ["full_attention"],
+        vocab_size=VOCAB,
+        hidden_size=1024,
+        num_attention_heads=8,
+        head_dim=256,
+        gdp_num_heads=8,
+        gdp_num_groups=8,
+        gdp_head_dim=64,
+        gdp_key_head_dim=128,
+        max_position_embeddings=4096,
+        num_nextn_predict_layers=1,
+        mtp_use_repeated_layer=True,
+        tie_word_embeddings=False,
+    )
+    save_checkpoint_config(tmp_path, text, image_token_id=VOCAB - 1)
+    outputs = []
+    for sharing in (False, True):
+        output, metrics = run(
+            tmp_path,
+            K,
+            speculative_config={
+                "method": "mtp",
+                "num_speculative_tokens": 3,
+                "index_share_for_mtp_iteration": sharing,
+            },
+        )
+        outputs.append(
+            [(o.outputs[0].token_ids, "", o.outputs[0].logprobs) for o in output]
+        )
+        assert metrics["vllm:spec_decode_num_accepted_tokens"].value > 0
+    check_logprobs_close(
+        outputs_0_lst=outputs[0],
+        outputs_1_lst=outputs[1],
+        name_0="fresh MTP selections",
+        name_1="shared MTP selections",
+    )

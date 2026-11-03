@@ -3,6 +3,7 @@
 
 import dataclasses
 from collections.abc import Iterable
+from typing import cast
 
 import torch
 from torch import nn
@@ -24,6 +25,7 @@ from vllm.models.common.ops.sequence_parallel import sp_all_gather
 from vllm.models.nemotron_shortcut.nvidia.sdsa.backend import (
     SDSA_CORE_HEAD_SIZE,
     SdsaAttentionBackend,
+    SdsaAttentionImpl,
     SdsaIndexerBackend,
     SdsaIndexerMetadata,
 )
@@ -89,22 +91,36 @@ SDSA_INDEXER_OP = "vllm::nemotron_shortcut_sdsa_indexer"
 
 @eager_break_during_capture
 def nemotron_shortcut_sdsa_indexer(
-    query: torch.Tensor,
-    key: torch.Tensor,
+    query: torch.Tensor | None,
+    key: torch.Tensor | None,
     topk_indices: torch.Tensor,
     valid_counts: torch.Tensor,
+    prefill_topk: torch.Tensor | None,
     layer_name: LayerNameType,
+    hidden_states: torch.Tensor | None = None,
 ) -> None:
     layer = get_forward_context().no_compile_layers[_resolve_layer_name(layer_name)]
+    if layer.skip_topk:
+        return
+    # TODO: Move indexer projections outside the custom op while preserving
+    # runtime skipping when compile guards are disabled.
+    if hidden_states is not None:
+        assert layer.indexer_projections is not None
+        q_proj, k_proj = layer.indexer_projections
+        query, _ = q_proj(hidden_states)
+        key, _ = k_proj(hidden_states)
+    assert query is not None and key is not None
     layer.select(query, key)
 
 
 def nemotron_shortcut_sdsa_indexer_fake(
-    query: torch.Tensor,
-    key: torch.Tensor,
+    query: torch.Tensor | None,
+    key: torch.Tensor | None,
     topk_indices: torch.Tensor,
     valid_counts: torch.Tensor,
+    prefill_topk: torch.Tensor | None,
     layer_name: LayerNameType,
+    hidden_states: torch.Tensor | None = None,
 ) -> None:
     return
 
@@ -112,7 +128,7 @@ def nemotron_shortcut_sdsa_indexer_fake(
 direct_register_custom_op(
     op_name="nemotron_shortcut_sdsa_indexer",
     op_func=nemotron_shortcut_sdsa_indexer,
-    mutates_args=["topk_indices", "valid_counts"],
+    mutates_args=["topk_indices", "valid_counts", "prefill_topk"],
     fake_impl=nemotron_shortcut_sdsa_indexer_fake,
 )
 
@@ -206,6 +222,9 @@ class SdsaAttention(nn.Module):
         tp = get_tp_group().world_size
         self.decode_rows = 1 + vllm_config.num_speculative_tokens
         self.register_buffer("topk_indices", buffers.topk_indices, persistent=False)
+        self.register_buffer("prefill_topk_indices", None, persistent=False)
+        self.skip_topk = False
+        self.indexer_projections: tuple[nn.Module, nn.Module] | None = None
         self.register_buffer(
             "valid_counts",
             torch.empty(max_tokens, dtype=torch.int32),
@@ -259,13 +278,27 @@ class SdsaAttention(nn.Module):
             sdsa_config, indexer_cache_name, cache_config
         )
 
+    def enable_mtp_index_sharing(self) -> None:
+        """Keep logical selections separate from the prefill core's unions."""
+        self.prefill_topk_indices = self.topk_indices
+        rows = (
+            len(self.valid_counts) + (get_tp_group().world_size - 1) * self.decode_rows
+        )
+        self.topk_indices = torch.zeros_like(self.topk_indices[:rows])
+        cast(SdsaAttentionImpl, self.core.impl).topk_indices_buffer = self.topk_indices
+
+    def compact_topk_indices(self, token_indices: torch.Tensor) -> None:
+        assert self.prefill_topk_indices is not None
+        self.topk_indices[: len(token_indices)] = self.topk_indices[token_indices]
+
     def forward(
         self,
-        indexer_query: torch.Tensor,
-        indexer_key: torch.Tensor,
+        indexer_query: torch.Tensor | None,
+        indexer_key: torch.Tensor | None,
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
+        hidden_states: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if query.shape[0] == 0:
             return torch.empty_like(query)
@@ -274,7 +307,9 @@ class SdsaAttention(nn.Module):
             indexer_key,
             self.topk_indices,
             self.valid_counts,
+            self.prefill_topk_indices,
             _encode_layer_name(self.layer_name),
+            hidden_states,
         )
         input_shape = query.shape
         output = self.core(query.reshape(input_shape[0], -1), key, value)
@@ -444,15 +479,23 @@ class SdsaAttention(nn.Module):
                 gathered = sp_all_gather(own.view(torch.float32))[:num_decode_rows]
                 self.topk_indices[:num_decode_rows] = gathered.view(torch.int32)
         if prefill is not None:
+            prefill_topk = self.prefill_topk_indices
             prefill.run(
                 packed_query[num_decode_rows:],
                 _rows(query_scales, slice(num_decode_rows, None)),
                 key_cache,
                 key_scales,
-                out=self.topk_indices[num_decode_rows:],
+                out=(prefill_topk if prefill_topk is not None else self.topk_indices)[
+                    num_decode_rows:
+                ],
                 valid_counts=self.valid_counts,
                 mask=self.mask,
                 topk_workspace=topk_workspace,
+                logical_topk=(
+                    self.topk_indices[num_decode_rows:]
+                    if prefill_topk is not None
+                    else None
+                ),
             )
 
     def _fused_decode(

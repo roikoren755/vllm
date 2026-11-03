@@ -4,6 +4,7 @@
 from `history`, not the caches: each row selects its K best keys, and the output
 is attention over them. Indexer keys are E2M1 with a 6 per block of 16: exact."""
 
+from itertools import accumulate
 from types import SimpleNamespace
 
 import pytest
@@ -536,3 +537,121 @@ def test_nvfp4_writer_and_conversion_roundtrip() -> None:
             / original.float().square().mean()
         ).sqrt()
         assert relative_rmse.item() < 0.14
+
+
+@pytest.mark.parametrize("top_k", [512, 2048])
+def test_sdsa_retains_logical_selections_before_prefill_union(top_k):
+    """Unpad tiled query rows without converting their keys to physical slots."""
+    positions = torch.arange(top_k, device="cuda", dtype=torch.int32)[None, :]
+    offsets = 7 * torch.arange(5, device="cuda", dtype=torch.int32)[:, None]
+    positions = (positions + offsets) % top_k
+    positions[:, -3:] = -1
+    query_rows = torch.tensor([-1, 2, 0, -1, 1], device="cuda", dtype=torch.int32)
+    expected = positions.clone()
+    storage = torch.full((4, top_k + 16), -99, device="cuda", dtype=torch.int32)
+    output = storage[:, 8 : 8 + top_k]
+    prefill._store_logical_topk[(5,)](
+        positions,
+        query_rows,
+        output,
+        positions.stride(0),
+        output.stride(0),
+        top_k,
+    )
+    torch.testing.assert_close(output[:3], expected[[2, 4, 1]])
+    assert (output[3] == -99).all()
+    assert (storage[:, :8] == -99).all() and (storage[:, -8:] == -99).all()
+
+
+@pytest.mark.parametrize("prefill_fused", [False, True])
+@pytest.mark.parametrize("prefill_core", ["union", "token"])
+@pytest.mark.parametrize("query_lens", [(3, 3), (1, 5), (129, 5)])
+@pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
+@torch.inference_mode()
+def test_sdsa_mtp_reuses_last_query_selection_until_refresh(
+    query_lens, prefill_fused, prefill_core, kv_cache_dtype, workspace_init
+):
+    """Reuse logical selections, keep writing attention K/V, then refresh."""
+    config = SdsaConfig(
+        indexer_dtype="bf16", prefill_core=prefill_core, prefill_fused=prefill_fused
+    )
+    fixture = SdsaFixture(
+        worker_config(16, 8192, sum(query_lens), kv_cache_dtype, drafts=3), config
+    )
+    layer = fixture.layer
+    layer.enable_mtp_index_sharing()
+    seq_lens = (4096, 6144)
+    inputs = fixture.step(BatchSpec(list(seq_lens), list(query_lens)))
+    with set_forward_context(
+        fixture.metadata, fixture.config, slot_mapping=fixture.slot_mapping
+    ):
+        layer(*inputs)
+    logical = layer.topk_indices[: sum(query_lens)].clone()
+    buffers = (layer.topk_indices, layer.valid_counts, layer.mask)
+    snapshots = [buffer.clone() for buffer in buffers]
+    selected = fixture.selected_positions(sum(query_lens))
+    for buffer, snapshot in zip(buffers, snapshots):
+        buffer.copy_(snapshot)
+    torch.testing.assert_close(logical.sort(1).values, selected.sort(1).values.int())
+
+    last = torch.tensor(list(accumulate(query_lens)), device="cuda") - 1
+    layer.compact_topk_indices(last)
+    frozen = logical[last]
+    layer.skip_topk = True
+    for step in (1, 2):
+        lengths = [length + step for length in seq_lens]
+        inputs = fixture.step(BatchSpec(lengths, [1, 1]))
+        if step == 2:
+            fixture.slots[1] = -1
+        old_core = fixture.kv_cache.clone()
+        old_indexer = layer.indexer_cache.kv_cache.clone()
+        with set_forward_context(
+            fixture.metadata, fixture.config, slot_mapping=fixture.slot_mapping
+        ):
+            output = layer(None, None, *inputs[2:])
+        torch.testing.assert_close(layer.topk_indices[:2], frozen)
+        assert torch.equal(layer.indexer_cache.kv_cache, old_indexer)
+        slots = fixture.slots[:2]
+        live = slots >= 0
+        core_rows = fixture.kv_cache.view(-1, 2 * HEAD)
+        expected_kv = torch.cat((inputs[3].flatten(1), inputs[4].flatten(1)), -1)
+        cached = core_rows.view(E4M3).float() if layer.core.impl.fp8_kv else core_rows
+        if layer.core.impl.fp8_kv:
+            cached *= torch.tensor([K_SCALE] * HEAD + [V_SCALE] * HEAD, device="cuda")
+        torch.testing.assert_close(
+            cached[slots[live]].float(),
+            expected_kv[live].float(),
+            **(
+                dict(rtol=0.07, atol=0.001)
+                if layer.core.impl.fp8_kv
+                else dict(rtol=0, atol=0)
+            ),
+        )
+        old_core.view(-1, 2 * HEAD)[slots[live]] = core_rows[slots[live]]
+        assert torch.equal(fixture.kv_cache, old_core)
+        selected_slots = fixture.slot[fixture.request[:, None], frozen.clamp(min=0)]
+        keys, values = cached[selected_slots].float().chunk(2, -1)
+        query = inputs[2].float()
+        if layer.core.impl.fp8_kv:
+            query = (query / Q_SCALE).to(E4M3).float() * Q_SCALE
+        scores = query @ keys.transpose(1, 2) * layer.core.impl.scale
+        scores.masked_fill_(frozen[:, None] < 0, -torch.inf)
+        torch.testing.assert_close(
+            output.float(),
+            scores.softmax(-1) @ values,
+            **(
+                dict(rtol=0.06, atol=0.08)
+                if layer.core.impl.fp8_kv
+                else dict(rtol=0.02, atol=0.01)
+            ),
+        )
+
+    layer.skip_topk = False
+    inputs = fixture.step(BatchSpec([length + 3 for length in seq_lens], [1, 1]))
+    scratch = layer.prefill_topk_indices.clone()
+    with set_forward_context(
+        fixture.metadata, fixture.config, slot_mapping=fixture.slot_mapping
+    ):
+        output = layer(*inputs)
+    fixture.check(inputs, output)
+    torch.testing.assert_close(layer.prefill_topk_indices, scratch)
