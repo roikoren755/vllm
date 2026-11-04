@@ -45,7 +45,7 @@ class MambaConfig:
 
     prefill_backend: MambaBackendEnum | None = None
     """Mamba2 SSD prefill backend. None inherits `backend`, falling back to
-    Triton if an inherited FlashInfer SSD is unavailable."""
+    Triton where FlashInfer SSD is unavailable (it needs SM10x or SM110)."""
 
     enable_stochastic_rounding: bool = False
     """Enable stochastic rounding when writing SSM state to fp16 cache.
