@@ -50,6 +50,7 @@ from vllm.models.nemotron_shortcut.nvidia.sdsa.prefill import (
     write_index_qk,
 )
 from vllm.platforms import current_platform
+from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.torch_utils import (
     LayerNameType,
@@ -62,6 +63,33 @@ from vllm.v1.kv_cache_interface import is_quantized_kv_cache
 from vllm.v1.worker.workspace import current_workspace_manager
 
 E4M3 = torch.float8_e4m3fn
+
+
+@triton.jit
+def _include_mtp_draft_token(
+    topk_indices,
+    dense_lens,
+    fused_lens,
+    ROW_STRIDE: tl.constexpr,
+    ROWS_PER_REQUEST: tl.constexpr,
+    TOP_K: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    request = row // ROWS_PER_REQUEST
+    length = tl.full((), 0, tl.int32)
+    if dense_lens is not None:
+        length += tl.load(dense_lens + request)
+    if fused_lens is not None:
+        length += tl.load(fused_lens + request)
+    position = length - ROWS_PER_REQUEST + row % ROWS_PER_REQUEST
+    if position >= 0:
+        indices = topk_indices + row * ROW_STRIDE
+        keys = tl.load(indices + tl.arange(0, TOP_K))
+        present = tl.sum((keys == position).to(tl.int32), 0) > 0
+        if not present:
+            # -1 slots precede every valid logical position in the reduction.
+            slot = tl.argmin(keys, 0, tie_break_left=True)
+            tl.store(indices + slot, position)
 
 
 class SdsaIndexerCache(DeepseekV32IndexerCache):
@@ -101,6 +129,25 @@ def nemotron_shortcut_sdsa_indexer(
 ) -> None:
     layer = get_forward_context().no_compile_layers[_resolve_layer_name(layer_name)]
     if layer.skip_topk:
+        if layer.sdsa_config.mtp_include_draft_tokens:
+            attn_metadata = get_forward_context().attn_metadata
+            if attn_metadata is not None:
+                assert isinstance(attn_metadata, dict)
+                metadata = attn_metadata[layer.indexer_cache.prefix]
+                assert isinstance(metadata, SdsaIndexerMetadata)
+                rows = min(
+                    metadata.num_actual_tokens,
+                    metadata.num_decodes * metadata.decode_rows,
+                )
+                if rows:
+                    _include_mtp_draft_token[(rows,)](
+                        topk_indices,
+                        metadata.dense_lens,
+                        metadata.fused_lens,
+                        topk_indices.stride(0),
+                        metadata.decode_rows,
+                        topk_indices.shape[1],
+                    )
         return
     # TODO: Move indexer projections outside the custom op while preserving
     # runtime skipping when compile guards are disabled.

@@ -131,9 +131,10 @@ def test_mtp_index_sharing_preserves_target_outputs(tmp_path, monkeypatch) -> No
         mtp_use_repeated_layer=True,
         tie_word_embeddings=False,
     )
-    save_checkpoint_config(tmp_path, text, image_token_id=VOCAB - 1)
     outputs = []
-    for sharing in (False, True):
+    for sharing, include_drafts in ((False, False), (True, False), (True, True)):
+        text.sdsa_mtp_include_draft_tokens = include_drafts
+        save_checkpoint_config(tmp_path, text, image_token_id=VOCAB - 1)
         output, metrics = run(
             tmp_path,
             K,
@@ -147,9 +148,12 @@ def test_mtp_index_sharing_preserves_target_outputs(tmp_path, monkeypatch) -> No
             [(o.outputs[0].token_ids, "", o.outputs[0].logprobs) for o in output]
         )
         assert metrics["vllm:spec_decode_num_accepted_tokens"].value > 0
-    check_logprobs_close(
-        outputs_0_lst=outputs[0],
-        outputs_1_lst=outputs[1],
-        name_0="fresh MTP selections",
-        name_1="shared MTP selections",
-    )
+    for name, output in zip(
+        ("frozen selections", "draft-inclusive selections"), outputs[1:]
+    ):
+        check_logprobs_close(
+            outputs_0_lst=outputs[0],
+            outputs_1_lst=output,
+            name_0="fresh MTP selections",
+            name_1=name,
+        )

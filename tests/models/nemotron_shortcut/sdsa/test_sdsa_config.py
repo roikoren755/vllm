@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from vllm.config import CompilationConfig, CompilationMode
-from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.models.nemotron_shortcut.nvidia.sdsa import (
     SdsaAttention,
     SdsaConfig,
@@ -40,6 +40,17 @@ def test_sdsa_config_comes_from_the_model_config() -> None:
     assert get_sdsa_config(config, QUANTIZED).indexer_dtype == "nvfp4"
     config = TextConfig(index_topk=2048, sdsa_indexer_dtype="bf16")
     assert get_sdsa_config(config, QUANTIZED).indexer_dtype == "bf16"
+
+
+@pytest.mark.parametrize("include_drafts", [False, True])
+def test_mtp_draft_token_inclusion_comes_from_text_config(include_drafts) -> None:
+    config = TextConfig(index_topk=512, sdsa_mtp_include_draft_tokens=include_drafts)
+    projection = LinearBase(
+        16, 128, bias=False, params_dtype=torch.bfloat16, disable_tp=True
+    )
+    resolved = get_sdsa_config(config, projection)
+    assert resolved.mtp_include_draft_tokens is include_drafts
+    assert resolved.top_k == 512
 
 
 def test_sdsa_config_refuses_what_sdsa_does_not_have() -> None:

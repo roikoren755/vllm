@@ -86,6 +86,9 @@ class SdsaConfig:
     prefill_fused: bool | tuple[int, int] | Literal["auto"] = "auto"
     """Which prefill requests take the fused selector: all, none, or those with
     context in [lo, hi). "auto" fuses all."""
+    mtp_include_draft_tokens: bool = False
+    """Include causal draft keys during MTP index sharing, filling unused slots
+    before evicting the oldest selected key. Requires index sharing."""
 
     # FA4's tile holds 128 query rows; trtllm-gen's token-sparse tile 64 heads.
     # Packed NVFP4 K/V is converted to FP8 per selected token, so only the token
@@ -171,6 +174,9 @@ def get_sdsa_config(text_config: Any, k_proj: LinearBase) -> SdsaConfig:
         decode_fused=getattr(text_config, "sdsa_decode_fused", "auto"),
         prefill_core=getattr(text_config, "sdsa_prefill_core", "auto"),
         prefill_fused=getattr(text_config, "sdsa_prefill_fused", "auto"),
+        mtp_include_draft_tokens=getattr(
+            text_config, "sdsa_mtp_include_draft_tokens", False
+        ),
     )
     logger.info_once(
         "SDSA: %s; k cache + indexer dot product dtype from %s",

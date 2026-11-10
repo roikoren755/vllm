@@ -22,7 +22,7 @@ from vllm.config import (
 )
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.models.nemotron_shortcut.nvidia import sdsa
-from vllm.models.nemotron_shortcut.nvidia.sdsa import backend, prefill
+from vllm.models.nemotron_shortcut.nvidia.sdsa import attention, backend, prefill
 from vllm.models.nemotron_shortcut.nvidia.sdsa.prefill import PAGE, SdsaConfig
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import nvfp4_split_data_scale
@@ -655,3 +655,83 @@ def test_sdsa_mtp_reuses_last_query_selection_until_refresh(
         output = layer(*inputs)
     fixture.check(inputs, output)
     torch.testing.assert_close(layer.prefill_topk_indices, scratch)
+
+
+@pytest.mark.parametrize("top_k", [512, 2048])
+@pytest.mark.parametrize("route", ["dense", "fused", "split"])
+@pytest.mark.parametrize("rows_per_request", [1, 4])
+@torch.inference_mode()
+def test_sdsa_shared_mtp_keeps_new_keys(route, rows_per_request, top_k) -> None:
+    """Graph replays fill spare slots, then evict oldest logical keys, once."""
+    rows = 5 * rows_per_request
+    history = torch.randperm(top_k, generator=torch.Generator().manual_seed(0))
+    initial = torch.full((rows, top_k), -1, dtype=torch.int32)
+    lengths = (
+        torch.tensor(
+            [5, top_k + 2, -rows_per_request, top_k + 10, top_k - 1],
+            dtype=torch.int32,
+        )
+        + rows_per_request
+    )
+    for row in range(rows):
+        request = row // rows_per_request
+        if request == 0:
+            initial[row, :5] = torch.tensor([2, 0, 4, 1, 3])
+        elif request in (1, 2):
+            initial[row] = history
+        elif request == 3:
+            initial[row, 0] = (
+                lengths[request] - rows_per_request + row % rows_per_request
+            )
+        else:
+            initial[row, : top_k - 1] = torch.arange(top_k - 2, -1, -1)
+    # Offset views exercise unaligned pointers and a non-contiguous row stride.
+    storage = torch.full((rows + 2, top_k + 1), -2, dtype=torch.int32, device="cuda")
+    indices = storage[1:-1, :top_k]
+    indices.copy_(initial)
+    dense = (
+        None if route == "fused" else torch.zeros(5, dtype=torch.int32, device="cuda")
+    )
+    fused = (
+        None if route == "dense" else torch.zeros(5, dtype=torch.int32, device="cuda")
+    )
+
+    def update():
+        attention._include_mtp_draft_token[(rows,)](
+            indices, dense, fused, indices.stride(0), rows_per_request, top_k
+        )
+
+    update()
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        update()
+    selected = [[key for key in row if key >= 0] for row in initial.tolist()]
+    use_fused = torch.arange(5) % 2 == 1
+    for step in range(4):
+        current = lengths + step
+        current[2] = 0  # graph padding must remain unchanged
+        if dense is not None:
+            dense.copy_(
+                current.masked_fill(use_fused, 0) if route == "split" else current
+            )
+        if fused is not None:
+            fused.copy_(
+                current.masked_fill(~use_fused, 0) if route == "split" else current
+            )
+        for row, keys in enumerate(selected):
+            position = int(current[row // rows_per_request]) - rows_per_request
+            position += row % rows_per_request
+            if position >= 0 and position not in keys:
+                if len(keys) == top_k:
+                    keys.remove(min(keys))
+                keys.append(position)
+        graph.replay()
+        # Replaying the same position twice must not insert it twice or evict twice.
+        graph.replay()
+        expected = torch.tensor(
+            [keys + [-1] * (top_k - len(keys)) for keys in selected], dtype=torch.int32
+        )
+        assert torch.equal(indices.cpu().sort(1).values, expected.sort(1).values)
+    assert bool((storage[0] == -2).all() & (storage[-1] == -2).all())
+    assert bool((storage[:, -1] == -2).all())

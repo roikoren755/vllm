@@ -264,6 +264,9 @@ class NemotronShortcutMTP(
         config.sdsa_decode_fused = getattr(target_config, "sdsa_decode_fused", "auto")
         config.sdsa_prefill_core = getattr(target_config, "sdsa_prefill_core", "auto")
         config.sdsa_prefill_fused = getattr(target_config, "sdsa_prefill_fused", "auto")
+        config.sdsa_mtp_include_draft_tokens = getattr(
+            target_config, "sdsa_mtp_include_draft_tokens", False
+        )
 
         self.model = NemotronShortcutMultiTokenPredictor(
             vllm_config=vllm_config,

@@ -84,7 +84,19 @@ vllm serve /path/to/checkpoint --tensor-parallel-size 2 \
 ```
 
 Set `index_share_for_mtp_iteration` to `false` to compare without sharing.
-Shared selections remain fixed until the next target verification.
+Shared selections remain fixed until the next target verification. To include
+new draft keys, set `SdsaConfig.mtp_include_draft_tokens` through the target's
+`sdsa_mtp_include_draft_tokens` text-config field:
+
+```bash
+vllm serve /path/to/checkpoint --tensor-parallel-size 2 \
+    --hf-overrides '{"text_config":{"sdsa_mtp_include_draft_tokens":true}}' \
+    --speculative-config '{"method":"mtp","num_speculative_tokens":5,"index_share_for_mtp_iteration":true}'
+```
+
+New draft keys fill unused slots, then replace the oldest selected logical
+positions. The selection budget remains `index_topk`; the next verification
+starts a fresh selection. This policy only applies when index sharing is on.
 
 ## Notes
 
