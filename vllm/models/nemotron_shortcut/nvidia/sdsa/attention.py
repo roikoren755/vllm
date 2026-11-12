@@ -65,7 +65,7 @@ from vllm.v1.worker.workspace import current_workspace_manager
 E4M3 = torch.float8_e4m3fn
 
 
-@triton.jit
+@triton.jit(do_not_specialize_on_alignment=["dense_lens", "fused_lens"])
 def _include_mtp_draft_token(
     topk_indices,
     dense_lens,
@@ -74,6 +74,10 @@ def _include_mtp_draft_token(
     ROWS_PER_REQUEST: tl.constexpr,
     TOP_K: tl.constexpr,
 ):
+    """Insert each row's causal input position into int32 `[rows, K]` logical keys.
+
+    Fill -1 slots first, otherwise replace the oldest selected logical position.
+    """
     row = tl.program_id(0).to(tl.int64)
     request = row // ROWS_PER_REQUEST
     length = tl.full((), 0, tl.int32)
